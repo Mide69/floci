@@ -123,6 +123,53 @@ class CloudFormationGetTemplateSummaryIntegrationTest {
     }
 
     @Test
+    void byStackName_onDeployedSamStack_stillReflectsOriginalTransformAndTypes() {
+        // CreateStack expands AWS::Serverless::Function to AWS::Lambda::Function and drops the
+        // Transform key from the stored (post-transform) template body. GetTemplateSummary by
+        // StackName must still summarize the template as originally submitted, matching what
+        // sam deploy expects to see back for a stack it is about to update.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "get-template-summary-sam-stack-" + suffix;
+        String template = """
+                {
+                  "Transform": "AWS::Serverless-2016-10-31",
+                  "Resources": {
+                    "MyFunction": {
+                      "Type": "AWS::Serverless::Function",
+                      "Properties": {
+                        "Handler": "index.handler",
+                        "Runtime": "nodejs22.x",
+                        "InlineCode": "exports.handler = async () => {};"
+                      }
+                    }
+                  }
+                }
+                """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplateSummary")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<member>AWS::Serverless-2016-10-31</member>"))
+            .body(containsString("<member>AWS::Serverless::Function</member>"))
+            .body(not(containsString("AWS::Lambda::Function")));
+    }
+
+    @Test
     void reportsCapabilityIam_whenTemplateHasIamResources() {
         String template = """
                 {
@@ -150,6 +197,37 @@ class CloudFormationGetTemplateSummaryIntegrationTest {
             .statusCode(200)
             .body(containsString("<member>CAPABILITY_IAM</member>"))
             .body(containsString("AWS::IAM::Role"));
+    }
+
+    @Test
+    void reportsCapabilityNamedIam_whenIamResourceHasExplicitName() {
+        String template = """
+                {
+                  "Resources": {
+                    "MyRole": {
+                      "Type": "AWS::IAM::Role",
+                      "Properties": {
+                        "RoleName": "my-explicit-role-name",
+                        "AssumeRolePolicyDocument": {
+                          "Version": "2012-10-17",
+                          "Statement": []
+                        }
+                      }
+                    }
+                  }
+                }
+                """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplateSummary")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<member>CAPABILITY_NAMED_IAM</member>"))
+            .body(not(containsString("<member>CAPABILITY_IAM</member>")));
     }
 
     @Test

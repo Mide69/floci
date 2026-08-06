@@ -324,6 +324,15 @@ public class CloudFormationService {
 
     // ── GetTemplateSummary ────────────────────────────────────────────────────
 
+    // IAM resource types whose corresponding property, when a literal string, requires
+    // CAPABILITY_NAMED_IAM instead of the weaker CAPABILITY_IAM.
+    private static final Map<String, String> IAM_RESOURCE_NAME_PROPERTY = Map.of(
+            "AWS::IAM::Role", "RoleName",
+            "AWS::IAM::User", "UserName",
+            "AWS::IAM::Group", "GroupName",
+            "AWS::IAM::ManagedPolicy", "ManagedPolicyName",
+            "AWS::IAM::InstanceProfile", "InstanceProfileName");
+
     /**
      * Summarizes a template's Parameters, Resources, Transform and Metadata sections. Accepts the
      * same three input modes as the real API: an existing stack by name, an inline TemplateBody, or
@@ -336,7 +345,11 @@ public class CloudFormationService {
         String resolvedBody;
         if (stackName != null && !stackName.isBlank()) {
             Stack stack = getStackOrThrow(stackName, region);
-            resolvedBody = stack.getTemplateBody() != null ? stack.getTemplateBody() : "{}";
+            // Summarize the template as submitted, not the SAM-expanded version stack.getTemplateBody()
+            // holds post-transform; fall back to it only for stacks persisted before this field existed.
+            resolvedBody = stack.getOriginalTemplateBody() != null
+                    ? stack.getOriginalTemplateBody()
+                    : stack.getTemplateBody() != null ? stack.getTemplateBody() : "{}";
         } else {
             resolvedBody = resolveTemplateBody(templateBody, templateUrl);
             if (resolvedBody == null) {
@@ -374,14 +387,23 @@ public class CloudFormationService {
         }
 
         LinkedHashSet<String> resourceTypes = new LinkedHashSet<>();
+        boolean hasNamedIamResource = false;
         JsonNode resourcesNode = template.path("Resources");
         if (resourcesNode.isObject()) {
-            resourcesNode.fields().forEachRemaining(entry -> {
-                JsonNode typeNode = entry.getValue().path("Type");
-                if (typeNode.isTextual()) {
-                    resourceTypes.add(typeNode.asText());
+            Iterator<Map.Entry<String, JsonNode>> resourceEntries = resourcesNode.fields();
+            while (resourceEntries.hasNext()) {
+                JsonNode resource = resourceEntries.next().getValue();
+                JsonNode typeNode = resource.path("Type");
+                if (!typeNode.isTextual()) {
+                    continue;
                 }
-            });
+                String type = typeNode.asText();
+                resourceTypes.add(type);
+                String nameProperty = IAM_RESOURCE_NAME_PROPERTY.get(type);
+                if (nameProperty != null && resource.path("Properties").path(nameProperty).isTextual()) {
+                    hasNamedIamResource = true;
+                }
+            }
         }
 
         List<String> declaredTransforms = new ArrayList<>();
@@ -399,7 +421,9 @@ public class CloudFormationService {
         List<String> iamResourceTypes = resourceTypes.stream()
                 .filter(t -> t.startsWith("AWS::IAM::"))
                 .toList();
-        List<String> capabilities = iamResourceTypes.isEmpty() ? List.of() : List.of("CAPABILITY_IAM");
+        List<String> capabilities = iamResourceTypes.isEmpty()
+                ? List.of()
+                : List.of(hasNamedIamResource ? "CAPABILITY_NAMED_IAM" : "CAPABILITY_IAM");
         String capabilitiesReason = iamResourceTypes.isEmpty()
                 ? null
                 : "The following resource(s) require capabilities: [" + String.join(", ", iamResourceTypes) + "]";
@@ -502,6 +526,7 @@ public class CloudFormationService {
                                  boolean isCreate, String region, String accountId) {
         try {
             JsonNode template = parseTemplate(templateBody);
+            stack.setOriginalTemplateBody(templateBody);
 
             // Apply SAM transform if the template declares AWS::Serverless-2016-10-31
             if (samTransformProcessor.hasSamTransform(template)) {
