@@ -709,7 +709,12 @@ public class CloudFormationResourceProvisioner {
                                    String region, String accountId, String stackName) {
         String name = resolveOptional(props, "LogGroupName", engine);
         if (name == null || name.isBlank()) {
-            name = generatePhysicalName(stackName, r.getLogicalId(), 512, false);
+            // No explicit name: keep the existing physical name across updates instead of generating a
+            // fresh random one each time, so an auto-named log group is reconciled in place rather than
+            // replaced on every no-op update.
+            name = r.getPhysicalId() != null
+                    ? r.getPhysicalId()
+                    : generatePhysicalName(stackName, r.getLogicalId(), 512, false);
         }
         Integer retentionInDays = null;
         String retention = resolveOptional(props, "RetentionInDays", engine);
@@ -729,11 +734,43 @@ public class CloudFormationResourceProvisioner {
                 }
             }
         }
-        logsService.createLogGroup(name, retentionInDays, tags, region);
+
+        // LogGroupName isn't updatable in place on real AWS (a change replaces the resource), so only
+        // reconcile in place when the name is unchanged and the group is still there; otherwise this is
+        // either a first create or a rename, both of which need a fresh createLogGroup call.
+        String priorPhysicalId = r.getPhysicalId();
+        if (priorPhysicalId != null && priorPhysicalId.equals(name) && logsService.logGroupExists(name, region)) {
+            reconcileLogGroup(name, retentionInDays, tags, region);
+        } else {
+            if (priorPhysicalId != null && !priorPhysicalId.equals(name)
+                    && logsService.logGroupExists(priorPhysicalId, region)) {
+                logsService.deleteLogGroup(priorPhysicalId, region);
+            }
+            logsService.createLogGroup(name, retentionInDays, tags, region);
+        }
+
         // Ref returns the log group name; GetAtt Arn is arn:aws:logs:<region>:<account>:log-group:<name>:*
         r.setPhysicalId(name);
         r.getAttributes().put("Arn",
                 AwsArnUtils.Arn.of("logs", region, accountId, "log-group:" + name + ":*").toString());
+    }
+
+    private void reconcileLogGroup(String name, Integer retentionInDays, Map<String, String> tags, String region) {
+        if (retentionInDays != null) {
+            logsService.putRetentionPolicy(name, retentionInDays, region);
+        } else {
+            logsService.deleteRetentionPolicy(name, region);
+        }
+        Map<String, String> existingTags = logsService.listTagsLogGroup(name, region);
+        List<String> tagsToRemove = existingTags.keySet().stream()
+                .filter(key -> !tags.containsKey(key))
+                .toList();
+        if (!tagsToRemove.isEmpty()) {
+            logsService.untagLogGroup(name, tagsToRemove, region);
+        }
+        if (!tags.isEmpty()) {
+            logsService.tagLogGroup(name, tags, region);
+        }
     }
 
     // ── Kinesis ─────────────────────────────────────────────────────────────────
