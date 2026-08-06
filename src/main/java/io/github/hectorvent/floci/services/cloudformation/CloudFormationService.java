@@ -346,7 +346,10 @@ public class CloudFormationService {
         if (stackName != null && !stackName.isBlank()) {
             Stack stack = getStackOrThrow(stackName, region);
             // Summarize the template as submitted, not the SAM-expanded version stack.getTemplateBody()
-            // holds post-transform; fall back to it only for stacks persisted before this field existed.
+            // holds post-transform. originalTemplateBody is only absent for stacks persisted by a
+            // floci version predating this field; there is no way to recover the pre-transform body
+            // for those, so this falls back to the (already-transformed) templateBody until the
+            // stack's next CreateChangeSet/UpdateStack call backfills the field.
             resolvedBody = stack.getOriginalTemplateBody() != null
                     ? stack.getOriginalTemplateBody()
                     : stack.getTemplateBody() != null ? stack.getTemplateBody() : "{}";
