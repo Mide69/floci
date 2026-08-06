@@ -231,6 +231,40 @@ class CloudFormationGetTemplateSummaryIntegrationTest {
     }
 
     @Test
+    void reportsCapabilityNamedIam_whenRoleNameIsAnIntrinsicFunction() {
+        // RoleName set via Fn::Sub (or Ref, Fn::Join, ...) only resolves at deploy time, but
+        // CloudFormation still requires CAPABILITY_NAMED_IAM whenever the property is present at
+        // all - this is the common real-world shape (SAM/CDK rarely hardcode literal names).
+        String template = """
+                {
+                  "Resources": {
+                    "MyRole": {
+                      "Type": "AWS::IAM::Role",
+                      "Properties": {
+                        "RoleName": { "Fn::Sub": "${AWS::StackName}-role" },
+                        "AssumeRolePolicyDocument": {
+                          "Version": "2012-10-17",
+                          "Statement": []
+                        }
+                      }
+                    }
+                  }
+                }
+                """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetTemplateSummary")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<member>CAPABILITY_NAMED_IAM</member>"))
+            .body(not(containsString("<member>CAPABILITY_IAM</member>")));
+    }
+
+    @Test
     void withoutIamResources_reportsNoCapabilities() {
         String template = """
                 {

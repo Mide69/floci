@@ -400,7 +400,10 @@ public class CloudFormationService {
                 String type = typeNode.asText();
                 resourceTypes.add(type);
                 String nameProperty = IAM_RESOURCE_NAME_PROPERTY.get(type);
-                if (nameProperty != null && resource.path("Properties").path(nameProperty).isTextual()) {
+                // Presence alone counts as named, even when the value is an intrinsic function
+                // (Ref, Fn::Sub, Fn::Join, ...) that only resolves at deploy time - CloudFormation
+                // requires CAPABILITY_NAMED_IAM whenever the property is set at all.
+                if (nameProperty != null && resource.path("Properties").has(nameProperty)) {
                     hasNamedIamResource = true;
                 }
             }
