@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -319,6 +320,94 @@ public class CloudFormationService {
     public String getTemplate(String stackName, String region) {
         Stack stack = getStackOrThrow(stackName, region);
         return stack.getTemplateBody() != null ? stack.getTemplateBody() : "{}";
+    }
+
+    // ── GetTemplateSummary ────────────────────────────────────────────────────
+
+    /**
+     * Summarizes a template's Parameters, Resources, Transform and Metadata sections. Accepts the
+     * same three input modes as the real API: an existing stack by name, an inline TemplateBody, or
+     * a TemplateURL. Floci does not enforce IAM capabilities on CreateStack/UpdateStack, so the
+     * Capabilities/CapabilitiesReason fields here are informational only, derived by scanning for
+     * AWS::IAM:: resource types.
+     */
+    public TemplateSummary getTemplateSummary(String stackName, String templateBody, String templateUrl,
+                                              String region) {
+        String resolvedBody;
+        if (stackName != null && !stackName.isBlank()) {
+            Stack stack = getStackOrThrow(stackName, region);
+            resolvedBody = stack.getTemplateBody() != null ? stack.getTemplateBody() : "{}";
+        } else {
+            resolvedBody = resolveTemplateBody(templateBody, templateUrl);
+            if (resolvedBody == null) {
+                throw new AwsException("ValidationError",
+                        "One of StackName, TemplateBody or TemplateURL must be specified.", 400);
+            }
+        }
+        JsonNode template;
+        try {
+            template = parseTemplate(resolvedBody);
+        } catch (Exception e) {
+            throw new AwsException("ValidationError", "Template format error: " + e.getMessage(), 400);
+        }
+        return buildTemplateSummary(template);
+    }
+
+    private TemplateSummary buildTemplateSummary(JsonNode template) {
+        String description = template.hasNonNull("Description") ? template.get("Description").asText() : null;
+        String version = template.hasNonNull("AWSTemplateFormatVersion")
+                ? template.get("AWSTemplateFormatVersion").asText()
+                : "2010-09-09";
+
+        List<TemplateSummary.ParameterDeclaration> parameters = new ArrayList<>();
+        JsonNode paramsNode = template.path("Parameters");
+        if (paramsNode.isObject()) {
+            paramsNode.fields().forEachRemaining(entry -> {
+                JsonNode p = entry.getValue();
+                parameters.add(new TemplateSummary.ParameterDeclaration(
+                        entry.getKey(),
+                        p.hasNonNull("Default") ? p.get("Default").asText() : null,
+                        p.path("NoEcho").asBoolean(false),
+                        p.hasNonNull("Description") ? p.get("Description").asText() : null,
+                        p.hasNonNull("Type") ? p.get("Type").asText() : "String"));
+            });
+        }
+
+        LinkedHashSet<String> resourceTypes = new LinkedHashSet<>();
+        JsonNode resourcesNode = template.path("Resources");
+        if (resourcesNode.isObject()) {
+            resourcesNode.fields().forEachRemaining(entry -> {
+                JsonNode typeNode = entry.getValue().path("Type");
+                if (typeNode.isTextual()) {
+                    resourceTypes.add(typeNode.asText());
+                }
+            });
+        }
+
+        List<String> declaredTransforms = new ArrayList<>();
+        JsonNode transformNode = template.path("Transform");
+        if (transformNode.isTextual()) {
+            declaredTransforms.add(transformNode.asText());
+        } else if (transformNode.isArray()) {
+            transformNode.forEach(t -> {
+                if (t.isTextual()) {
+                    declaredTransforms.add(t.asText());
+                }
+            });
+        }
+
+        List<String> iamResourceTypes = resourceTypes.stream()
+                .filter(t -> t.startsWith("AWS::IAM::"))
+                .toList();
+        List<String> capabilities = iamResourceTypes.isEmpty() ? List.of() : List.of("CAPABILITY_IAM");
+        String capabilitiesReason = iamResourceTypes.isEmpty()
+                ? null
+                : "The following resource(s) require capabilities: [" + String.join(", ", iamResourceTypes) + "]";
+
+        String metadata = template.hasNonNull("Metadata") ? template.get("Metadata").toString() : null;
+
+        return new TemplateSummary(description, parameters, new ArrayList<>(resourceTypes), version,
+                declaredTransforms, capabilities, capabilitiesReason, metadata);
     }
 
     // ── DescribeStackEvents ───────────────────────────────────────────────────
