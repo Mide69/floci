@@ -121,6 +121,7 @@ public class CloudFormationResourceProvisioner {
     private static final String INLINE_CLEANUP_GROUP_TARGETS_ATTR = "__FlociInlineCleanupGroupTargets";
     private static final String LAMBDA_NAME_MODE_EXPLICIT = "explicit";
     private static final String LAMBDA_NAME_MODE_GENERATED = "generated";
+    private static final String LOG_GROUP_NAME_MODE_ATTR = "FlociLogGroupNameMode";
     private static final String SECRET_TARGET_MANAGED_KEYS_ATTR = "__FlociSecretTargetManagedKeys";
     private static final String SECRET_TARGET_OWNER_ATTR = "__FlociSecretTargetOwner";
     private static final List<String> SECRET_TARGET_CONNECTION_KEYS = List.of(
@@ -707,14 +708,25 @@ public class CloudFormationResourceProvisioner {
 
     private void provisionLogGroup(StackResource r, JsonNode props, CloudFormationTemplateEngine engine,
                                    String region, String accountId, String stackName) {
-        String name = resolveOptional(props, "LogGroupName", engine);
-        if (name == null || name.isBlank()) {
-            // No explicit name: keep the existing physical name across updates instead of generating a
-            // fresh random one each time, so an auto-named log group is reconciled in place rather than
-            // replaced on every no-op update.
-            name = r.getPhysicalId() != null
-                    ? r.getPhysicalId()
-                    : generatePhysicalName(stackName, r.getLogicalId(), 512, false);
+        String explicitName = resolveOptional(props, "LogGroupName", engine);
+        boolean hasExplicitName = explicitName != null && !explicitName.isBlank();
+        String previousNameMode = r.getAttributes().get(LOG_GROUP_NAME_MODE_ATTR);
+        // Going from an explicit name to none is itself a replacement-worthy change on real AWS, not
+        // something to silently keep reconciling under the old explicit name (mirrors the same check
+        // for Lambda's FunctionName above).
+        boolean explicitNameRemoved = r.getPhysicalId() != null && !hasExplicitName
+                && LAMBDA_NAME_MODE_EXPLICIT.equals(previousNameMode);
+
+        String name;
+        if (hasExplicitName) {
+            name = explicitName;
+        } else if (r.getPhysicalId() != null && !explicitNameRemoved) {
+            // No explicit name and the prior name was itself auto-generated: keep it across updates
+            // instead of generating a fresh random one each time, so the log group is reconciled in
+            // place rather than replaced on every no-op update.
+            name = r.getPhysicalId();
+        } else {
+            name = generatePhysicalName(stackName, r.getLogicalId(), 512, false);
         }
         Integer retentionInDays = null;
         String retention = resolveOptional(props, "RetentionInDays", engine);
@@ -737,22 +749,27 @@ public class CloudFormationResourceProvisioner {
 
         // LogGroupName isn't updatable in place on real AWS (a change replaces the resource), so only
         // reconcile in place when the name is unchanged and the group is still there; otherwise this is
-        // either a first create or a rename, both of which need a fresh createLogGroup call.
+        // either a first create or a rename, both of which need a fresh createLogGroup call. On a rename,
+        // create the new group before deleting the old one: if the new name collides with something else
+        // and createLogGroup throws, the update rolls back without touching the old group, since rollback
+        // does not restore a resource this method already deleted.
         String priorPhysicalId = r.getPhysicalId();
         if (priorPhysicalId != null && priorPhysicalId.equals(name) && logsService.logGroupExists(name, region)) {
             reconcileLogGroup(name, retentionInDays, tags, region);
         } else {
+            logsService.createLogGroup(name, retentionInDays, tags, region);
             if (priorPhysicalId != null && !priorPhysicalId.equals(name)
                     && logsService.logGroupExists(priorPhysicalId, region)) {
                 logsService.deleteLogGroup(priorPhysicalId, region);
             }
-            logsService.createLogGroup(name, retentionInDays, tags, region);
         }
 
         // Ref returns the log group name; GetAtt Arn is arn:aws:logs:<region>:<account>:log-group:<name>:*
         r.setPhysicalId(name);
         r.getAttributes().put("Arn",
                 AwsArnUtils.Arn.of("logs", region, accountId, "log-group:" + name + ":*").toString());
+        r.getAttributes().put(LOG_GROUP_NAME_MODE_ATTR,
+                hasExplicitName ? LAMBDA_NAME_MODE_EXPLICIT : LAMBDA_NAME_MODE_GENERATED);
     }
 
     private void reconcileLogGroup(String name, Integer retentionInDays, Map<String, String> tags, String region) {

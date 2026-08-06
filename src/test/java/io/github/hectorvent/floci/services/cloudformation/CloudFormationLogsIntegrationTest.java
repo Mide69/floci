@@ -289,6 +289,145 @@ class CloudFormationLogsIntegrationTest {
             .body(not(containsString(oldName)));
     }
 
+    @Test
+    void updateStackRenameCollision_doesNotDeleteOldLogGroupBeforeVerifyingNewOneWorks() {
+        // If the new name is already taken, CreateLogGroup for it fails and the update rolls back.
+        // The old group must still be there afterward - deleting it before the new one is confirmed
+        // creatable would mean rollback can't restore what was already destroyed.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-logs-collision-stack-" + suffix;
+        String oldName = "/cfn/test/collision-old-" + suffix;
+        String takenName = "/cfn/test/collision-taken-" + suffix;
+
+        given()
+            .config(RestAssured.config().encoderConfig(EncoderConfig.encoderConfig()
+                    .encodeContentTypeAs("application/x-amz-json-1.1", ContentType.TEXT)))
+            .header("Authorization", LOGS_AUTH)
+            .header("X-Amz-Target", "Logs_20140328.CreateLogGroup")
+            .contentType("application/x-amz-json-1.1")
+            .body("{\"logGroupName\":\"" + takenName + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", logGroupTemplate(oldName, 7))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", logGroupTemplate(takenName, 7))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("UPDATE_ROLLBACK_COMPLETE"));
+
+        given()
+            .config(RestAssured.config().encoderConfig(EncoderConfig.encoderConfig()
+                    .encodeContentTypeAs("application/x-amz-json-1.1", ContentType.TEXT)))
+            .header("Authorization", LOGS_AUTH)
+            .header("X-Amz-Target", "Logs_20140328.DescribeLogGroups")
+            .contentType("application/x-amz-json-1.1")
+            .body("{\"logGroupNamePrefix\":\"" + oldName + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString(oldName));
+    }
+
+    @Test
+    void updateStackRemovingExplicitName_generatesFreshNameInsteadOfKeepingOld() {
+        // Going from an explicit LogGroupName to none is a naming-mode change, which is itself a
+        // replacement on real AWS - the group must get a freshly generated name, not silently keep
+        // reconciling under the removed explicit name.
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-logs-name-removed-stack-" + suffix;
+        String explicitName = "/cfn/test/explicit-" + suffix;
+        String templateNoName = """
+                {
+                  "Resources": {
+                    "LogGroup": {
+                      "Type": "AWS::Logs::LogGroup",
+                      "Properties": {}
+                    }
+                  },
+                  "Outputs": {
+                    "GroupArn": {"Value": {"Fn::GetAtt": ["LogGroup", "Arn"]}}
+                  }
+                }
+                """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", logGroupTemplate(explicitName, 7))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", templateNoName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .header("Authorization", CFN_AUTH)
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
+            .body(not(containsString("log-group:" + explicitName + ":*")));
+
+        given()
+            .config(RestAssured.config().encoderConfig(EncoderConfig.encoderConfig()
+                    .encodeContentTypeAs("application/x-amz-json-1.1", ContentType.TEXT)))
+            .header("Authorization", LOGS_AUTH)
+            .header("X-Amz-Target", "Logs_20140328.DescribeLogGroups")
+            .contentType("application/x-amz-json-1.1")
+            .body("{\"logGroupNamePrefix\":\"" + explicitName + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString(explicitName)));
+    }
+
     private static String logGroupTemplate(String logGroupName, int retentionInDays) {
         return """
                 {
