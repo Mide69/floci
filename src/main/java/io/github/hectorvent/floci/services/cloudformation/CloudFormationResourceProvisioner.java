@@ -711,6 +711,14 @@ public class CloudFormationResourceProvisioner {
         String explicitName = resolveOptional(props, "LogGroupName", engine);
         boolean hasExplicitName = explicitName != null && !explicitName.isBlank();
         String previousNameMode = r.getAttributes().get(LOG_GROUP_NAME_MODE_ATTR);
+        if (previousNameMode == null && r.getPhysicalId() != null) {
+            // Stacks persisted before FlociLogGroupNameMode existed have no recorded mode, but an
+            // auto-generated name always has the deterministic <stackName>-<logicalId>-<12 hex chars>
+            // shape generatePhysicalName produces, so anything else must have been explicit.
+            previousNameMode = isGeneratedLogGroupName(r.getPhysicalId(), stackName, r.getLogicalId())
+                    ? LAMBDA_NAME_MODE_GENERATED
+                    : LAMBDA_NAME_MODE_EXPLICIT;
+        }
         // Going from an explicit name to none is itself a replacement-worthy change on real AWS, not
         // something to silently keep reconciling under the old explicit name (mirrors the same check
         // for Lambda's FunctionName above).
@@ -770,6 +778,32 @@ public class CloudFormationResourceProvisioner {
                 AwsArnUtils.Arn.of("logs", region, accountId, "log-group:" + name + ":*").toString());
         r.getAttributes().put(LOG_GROUP_NAME_MODE_ATTR,
                 hasExplicitName ? LAMBDA_NAME_MODE_EXPLICIT : LAMBDA_NAME_MODE_GENERATED);
+    }
+
+    /**
+     * Whether {@code physicalId} matches the exact shape {@link #generatePhysicalName} produces for
+     * this stack/logical id: {@code <stackName>-<logicalId>-} followed by exactly 12 lowercase hex
+     * characters. Doesn't account for the (practically unreachable at a 512-character limit)
+     * truncation path in {@link #generatePhysicalName}, so a truncated legacy name is conservatively
+     * treated as explicit rather than misdetected as generated.
+     */
+    private boolean isGeneratedLogGroupName(String physicalId, String stackName, String logicalId) {
+        String prefix = stackName + "-" + logicalId + "-";
+        if (!physicalId.startsWith(prefix)) {
+            return false;
+        }
+        String suffix = physicalId.substring(prefix.length());
+        if (suffix.length() != 12) {
+            return false;
+        }
+        for (int i = 0; i < suffix.length(); i++) {
+            char c = suffix.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!hex) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void reconcileLogGroup(String name, Integer retentionInDays, Map<String, String> tags, String region) {
