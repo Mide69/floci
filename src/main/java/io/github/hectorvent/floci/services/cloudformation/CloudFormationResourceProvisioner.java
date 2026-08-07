@@ -119,8 +119,8 @@ public class CloudFormationResourceProvisioner {
     private static final String INLINE_CLEANUP_ROLE_TARGETS_ATTR = "__FlociInlineCleanupRoleTargets";
     private static final String INLINE_CLEANUP_USER_TARGETS_ATTR = "__FlociInlineCleanupUserTargets";
     private static final String INLINE_CLEANUP_GROUP_TARGETS_ATTR = "__FlociInlineCleanupGroupTargets";
-    private static final String LAMBDA_NAME_MODE_EXPLICIT = "explicit";
-    private static final String LAMBDA_NAME_MODE_GENERATED = "generated";
+    private static final String NAME_MODE_EXPLICIT = "explicit";
+    private static final String NAME_MODE_GENERATED = "generated";
     private static final String LOG_GROUP_NAME_MODE_ATTR = "FlociLogGroupNameMode";
     private static final String SECRET_TARGET_MANAGED_KEYS_ATTR = "__FlociSecretTargetManagedKeys";
     private static final String SECRET_TARGET_OWNER_ATTR = "__FlociSecretTargetOwner";
@@ -716,14 +716,14 @@ public class CloudFormationResourceProvisioner {
             // auto-generated name always has the deterministic <stackName>-<logicalId>-<12 hex chars>
             // shape generatePhysicalName produces, so anything else must have been explicit.
             previousNameMode = isGeneratedLogGroupName(r.getPhysicalId(), stackName, r.getLogicalId())
-                    ? LAMBDA_NAME_MODE_GENERATED
-                    : LAMBDA_NAME_MODE_EXPLICIT;
+                    ? NAME_MODE_GENERATED
+                    : NAME_MODE_EXPLICIT;
         }
         // Going from an explicit name to none is itself a replacement-worthy change on real AWS, not
         // something to silently keep reconciling under the old explicit name (mirrors the same check
         // for Lambda's FunctionName above).
         boolean explicitNameRemoved = r.getPhysicalId() != null && !hasExplicitName
-                && LAMBDA_NAME_MODE_EXPLICIT.equals(previousNameMode);
+                && NAME_MODE_EXPLICIT.equals(previousNameMode);
 
         String name;
         if (hasExplicitName) {
@@ -777,7 +777,7 @@ public class CloudFormationResourceProvisioner {
         r.getAttributes().put("Arn",
                 AwsArnUtils.Arn.of("logs", region, accountId, "log-group:" + name + ":*").toString());
         r.getAttributes().put(LOG_GROUP_NAME_MODE_ATTR,
-                hasExplicitName ? LAMBDA_NAME_MODE_EXPLICIT : LAMBDA_NAME_MODE_GENERATED);
+                hasExplicitName ? NAME_MODE_EXPLICIT : NAME_MODE_GENERATED);
     }
 
     /**
@@ -1506,7 +1506,7 @@ public class CloudFormationResourceProvisioner {
         r.getAttributes().put("Arn", func.getFunctionArn());
         r.getAttributes().put(LAMBDA_CODE_IDENTITY_ATTR, desired.code().identity());
         r.getAttributes().put(LAMBDA_NAME_MODE_ATTR,
-                desired.explicitFunctionName() ? LAMBDA_NAME_MODE_EXPLICIT : LAMBDA_NAME_MODE_GENERATED);
+                desired.explicitFunctionName() ? NAME_MODE_EXPLICIT : NAME_MODE_GENERATED);
         r.getAttributes().put(LAMBDA_PACKAGE_TYPE_ATTR, desired.packageType());
     }
 
@@ -1524,7 +1524,7 @@ public class CloudFormationResourceProvisioner {
                 && !Objects.equals(oldPackageType, packageType);
         boolean explicitRemoved = r.getPhysicalId() != null
                 && !hasExplicitName
-                && LAMBDA_NAME_MODE_EXPLICIT.equals(previousNameMode);
+                && NAME_MODE_EXPLICIT.equals(previousNameMode);
 
         String functionName;
         if (hasExplicitName) {
