@@ -785,6 +785,11 @@ public class CloudFormationResourceProvisioner {
      * this stack/logical id/maxLength: its base-and-truncation logic (minus the random suffix itself)
      * followed by exactly 12 lowercase hex characters. Used to infer a legacy resource's name mode
      * (explicit vs. generated) when it predates whatever attribute would otherwise record that.
+     *
+     * <p>Assumes the {@code generatePhysicalName} call this mirrors used {@code lowercase=false} (true
+     * of both current callers, LogGroup and Lambda) and a {@code maxLength} large enough that the
+     * truncated prefix is never empty, i.e. {@code maxLength > 13} (also true of both: 512 and 64). A
+     * future caller with {@code lowercase=true} or a smaller limit would need this generalized further.
      */
     private boolean isGeneratedName(String physicalId, String stackName, String logicalId, int maxLength) {
         if (physicalId == null || physicalId.length() < 13) {
