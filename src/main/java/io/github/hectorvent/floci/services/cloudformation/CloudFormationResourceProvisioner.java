@@ -713,9 +713,9 @@ public class CloudFormationResourceProvisioner {
         String previousNameMode = r.getAttributes().get(LOG_GROUP_NAME_MODE_ATTR);
         if (previousNameMode == null && r.getPhysicalId() != null) {
             // Stacks persisted before FlociLogGroupNameMode existed have no recorded mode, but an
-            // auto-generated name always has the deterministic <stackName>-<logicalId>-<12 hex chars>
-            // shape generatePhysicalName produces, so anything else must have been explicit.
-            previousNameMode = isGeneratedLogGroupName(r.getPhysicalId(), stackName, r.getLogicalId())
+            // auto-generated name always has the deterministic shape generatePhysicalName produces,
+            // so anything else must have been explicit.
+            previousNameMode = isGeneratedName(r.getPhysicalId(), stackName, r.getLogicalId(), 512)
                     ? NAME_MODE_GENERATED
                     : NAME_MODE_EXPLICIT;
         }
@@ -782,20 +782,15 @@ public class CloudFormationResourceProvisioner {
 
     /**
      * Whether {@code physicalId} matches the exact shape {@link #generatePhysicalName} produces for
-     * this stack/logical id: {@code <stackName>-<logicalId>-} followed by exactly 12 lowercase hex
-     * characters. Doesn't account for the (practically unreachable at a 512-character limit)
-     * truncation path in {@link #generatePhysicalName}, so a truncated legacy name is conservatively
-     * treated as explicit rather than misdetected as generated.
+     * this stack/logical id/maxLength: its base-and-truncation logic (minus the random suffix itself)
+     * followed by exactly 12 lowercase hex characters. Used to infer a legacy resource's name mode
+     * (explicit vs. generated) when it predates whatever attribute would otherwise record that.
      */
-    private boolean isGeneratedLogGroupName(String physicalId, String stackName, String logicalId) {
-        String prefix = stackName + "-" + logicalId + "-";
-        if (!physicalId.startsWith(prefix)) {
+    private boolean isGeneratedName(String physicalId, String stackName, String logicalId, int maxLength) {
+        if (physicalId == null || physicalId.length() < 13) {
             return false;
         }
-        String suffix = physicalId.substring(prefix.length());
-        if (suffix.length() != 12) {
-            return false;
-        }
+        String suffix = physicalId.substring(physicalId.length() - 12);
         for (int i = 0; i < suffix.length(); i++) {
             char c = suffix.charAt(i);
             boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
@@ -803,7 +798,25 @@ public class CloudFormationResourceProvisioner {
                 return false;
             }
         }
-        return true;
+        if (physicalId.charAt(physicalId.length() - 13) != '-') {
+            return false;
+        }
+        String actualPrefix = physicalId.substring(0, physicalId.length() - 13);
+        return actualPrefix.equals(expectedGeneratedNamePrefix(stackName, logicalId, maxLength));
+    }
+
+    /** Mirrors {@link #generatePhysicalName}'s base-and-truncation logic, without the random suffix. */
+    private String expectedGeneratedNamePrefix(String stackName, String logicalId, int maxLength) {
+        String base = stackName + "-" + logicalId;
+        if (maxLength <= 0 || base.length() + 1 + 12 <= maxLength) {
+            return base;
+        }
+        int keep = Math.max(0, maxLength - 12 - 1);
+        String prefix = base.length() > keep ? base.substring(0, keep) : base;
+        while (prefix.endsWith("-")) {
+            prefix = prefix.substring(0, prefix.length() - 1);
+        }
+        return prefix;
     }
 
     private void reconcileLogGroup(String name, Integer retentionInDays, Map<String, String> tags, String region) {
@@ -1518,6 +1531,15 @@ public class CloudFormationResourceProvisioner {
         boolean hasExplicitName = explicitName != null && !explicitName.isBlank();
         String packageType = resolveOrDefault(props, "PackageType", engine, "Zip");
         String previousNameMode = r.getAttributes().get(LAMBDA_NAME_MODE_ATTR);
+        if (previousNameMode == null && r.getPhysicalId() != null) {
+            // Functions persisted before LAMBDA_NAME_MODE_ATTR existed have no recorded mode, but an
+            // auto-generated name always has the deterministic shape generatePhysicalName produces,
+            // so anything else must have been explicit (see #1965/#2152 for the LogGroup precedent
+            // this mirrors, and #2163 for this gap).
+            previousNameMode = isGeneratedName(r.getPhysicalId(), stackName, r.getLogicalId(), 64)
+                    ? NAME_MODE_GENERATED
+                    : NAME_MODE_EXPLICIT;
+        }
         String oldPackageType = r.getAttributes().get(LAMBDA_PACKAGE_TYPE_ATTR);
         boolean packageTypeReplacement = r.getPhysicalId() != null
                 && oldPackageType != null
