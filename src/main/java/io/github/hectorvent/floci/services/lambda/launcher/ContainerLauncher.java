@@ -494,39 +494,42 @@ public class ContainerLauncher {
      */
     private String ensureCodeVolume(LambdaFunction fn, String image) {
         String volName = codeVolumeName(fn);
-        if (!(populatedCodeVolumes.contains(volName) && lifecycleManager.volumeExists(volName))) {
-            // Either never populated, or the bookkeeping says populated but Docker disagrees
-            // (removed out of band). Repopulate rather than trust a stale flag.
-            populatedCodeVolumes.remove(volName);
-            Object lock = codeVolumeLocks.computeIfAbsent(volName, k -> new Object());
-            synchronized (lock) {
-                if (!(populatedCodeVolumes.contains(volName) && lifecycleManager.volumeExists(volName))) {
-                    long t0 = System.currentTimeMillis();
-                    LOG.infov("Populating code volume {0} for function {1} (one-time per code version)",
-                            volName, fn.getFunctionName());
-                    populateCodeVolume(volName, fn, image);
-                    populatedCodeVolumes.add(volName);
-                    // Bound codeVolumeLocks: drop the lock now that the volume is populated, so the
-                    // map only ever holds in-flight populates rather than growing across redeploys.
-                    // Safe under the lock: a late thread that computeIfAbsent's a fresh lock object
-                    // will still hit the populatedCodeVolumes.contains check inside its synchronized
-                    // block and return without re-populating.
-                    codeVolumeLocks.remove(volName);
-                    LOG.infov("Populated code volume {0} in {1}ms; future cold starts mount it instead of copying",
-                            volName, System.currentTimeMillis() - t0);
-                }
+        // Held for the whole resolve-and-reconcile, not just the populate branch: this is the same
+        // lock cleanupSupersededVolumes acquires before claiming a volume for deletion, so a launch
+        // that resolves a volume can never race a sweep that's about to delete that exact volume out
+        // from under it - whichever gets the lock first, the other reliably observes the result
+        // (rescued-from-cleanup, or actually-gone-and-needs-repopulating) rather than acting on
+        // stale state. Population itself is the only expensive part, and it happens at most once
+        // per code version regardless, so holding this for cheap map bookkeeping too costs nothing
+        // meaningful.
+        Object lock = codeVolumeLocks.computeIfAbsent(volName, k -> new Object());
+        synchronized (lock) {
+            if (!(populatedCodeVolumes.contains(volName) && lifecycleManager.volumeExists(volName))) {
+                // Either never populated, or the bookkeeping says populated but Docker disagrees
+                // (removed out of band). Repopulate rather than trust a stale flag.
+                long t0 = System.currentTimeMillis();
+                LOG.infov("Populating code volume {0} for function {1} (one-time per code version)",
+                        volName, fn.getFunctionName());
+                populateCodeVolume(volName, fn, image);
+                populatedCodeVolumes.add(volName);
+                LOG.infov("Populated code volume {0} in {1}ms; future cold starts mount it instead of copying",
+                        volName, System.currentTimeMillis() - t0);
             }
-        }
-        // Reconcile bookkeeping for the resolved volume even when the fast path above already
-        // returned it without populating anything: a redeploy rolled back to an older code version
-        // resolves a volume name that's already populated (fast path hit) but may have been queued
-        // as superseded by the deploy this just rolled back. Without pulling it back out of
-        // volumesPendingCleanup and marking it current again, the next sweep would delete the
-        // volume this function is actively using.
-        volumesPendingCleanup.remove(volName);
-        String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
-        if (previous != null && !previous.equals(volName)) {
-            volumesPendingCleanup.put(previous, System.currentTimeMillis());
+            // Reconcile bookkeeping for the resolved volume even when the check above already found
+            // it populated: a redeploy rolled back to an older code version resolves a volume name
+            // that's already populated but may have been queued as superseded by the deploy this
+            // just rolled back. Without pulling it back out of volumesPendingCleanup and marking it
+            // current again, the next sweep would delete the volume this function is actively using.
+            volumesPendingCleanup.remove(volName);
+            String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
+            if (previous != null && !previous.equals(volName)) {
+                volumesPendingCleanup.put(previous, System.currentTimeMillis());
+            }
+            // Bound codeVolumeLocks so it only ever holds locks genuinely in use, not one per
+            // redeploy ever seen. Safe: the next caller's computeIfAbsent gets a fresh lock object,
+            // but correctness comes from re-checking populatedCodeVolumes/volumesPendingCleanup state
+            // under whatever lock is currently held, not from a lock object's identity persisting.
+            codeVolumeLocks.remove(volName);
         }
         return volName;
     }
@@ -540,25 +543,36 @@ public class ContainerLauncher {
      */
     void cleanupSupersededVolumes() {
         long cutoff = System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS;
-        for (var entry : volumesPendingCleanup.entrySet()) {
-            if (entry.getValue() > cutoff) {
+        for (String volName : new java.util.ArrayList<>(volumesPendingCleanup.keySet())) {
+            Long queuedAt = volumesPendingCleanup.get(volName);
+            if (queuedAt == null || queuedAt > cutoff) {
                 continue;
             }
-            String volName = entry.getKey();
-            if (!volumesPendingCleanup.remove(volName, entry.getValue())) {
-                continue;
-            }
-            lifecycleManager.removeVolume(volName);
-            if (lifecycleManager.volumeExists(volName)) {
-                // Still in use (e.g. a slow-draining in-flight container outlived the grace
-                // period) - removeVolume() silently no-ops on that rather than signalling it, so
-                // without this the entry would be lost with no later sweep ever retrying it.
-                // Re-queue with a fresh timestamp and leave populatedCodeVolumes alone, since the
-                // volume is still there and still valid.
-                volumesPendingCleanup.put(volName, System.currentTimeMillis());
-            } else {
-                populatedCodeVolumes.remove(volName);
-                LOG.debugv("Removed superseded code volume {0}", volName);
+            // Same lock ensureCodeVolume holds for this volume name: claiming and deleting it here
+            // must not interleave with a concurrent launch resolving (and possibly rescuing) it.
+            Object lock = codeVolumeLocks.computeIfAbsent(volName, k -> new Object());
+            synchronized (lock) {
+                // Re-check under the lock: a concurrent ensureCodeVolume may have rescued this
+                // volume (removed it from volumesPendingCleanup) or requeued it with a fresher
+                // timestamp between the check above and acquiring this lock.
+                Long stillQueuedAt = volumesPendingCleanup.get(volName);
+                if (stillQueuedAt == null || stillQueuedAt > cutoff) {
+                    codeVolumeLocks.remove(volName);
+                    continue;
+                }
+                volumesPendingCleanup.remove(volName, stillQueuedAt);
+                lifecycleManager.removeVolume(volName);
+                if (lifecycleManager.volumeExists(volName)) {
+                    // Still in use (e.g. a slow-draining in-flight container outlived the grace
+                    // period) - removeVolume() silently no-ops on that rather than signalling it, so
+                    // without this the entry would be lost with no later sweep ever retrying it.
+                    // Leave populatedCodeVolumes alone, since the volume is still there and valid.
+                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                } else {
+                    populatedCodeVolumes.remove(volName);
+                    LOG.debugv("Removed superseded code volume {0}", volName);
+                }
+                codeVolumeLocks.remove(volName);
             }
         }
     }

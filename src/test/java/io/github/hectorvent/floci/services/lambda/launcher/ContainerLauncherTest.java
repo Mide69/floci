@@ -48,6 +48,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -803,6 +804,81 @@ class ContainerLauncherTest {
             // no-op'd attempt.
             launcher.cleanupSupersededVolumes();
             verify(lifecycleManager, times(2)).removeVolume(volumeV1);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
+    }
+
+    @Test
+    void cleanupAndAConcurrentRollback_areMutuallyExclusiveForTheSameVolume() throws Exception {
+        // Regression: without a shared per-volume lock, a sweep that has already claimed a
+        // superseded volume (removed its pending-cleanup entry) could race a concurrent rollback
+        // that resolves the same volume name, marks it current, and hands it to a new container -
+        // while the sweep proceeds to actually delete it underneath that launch. Proving this
+        // requires real concurrency: this test forces cleanupSupersededVolumes to block mid-deletion
+        // (still holding the volume's lock) and asserts a concurrent rollback blocks too, rather than
+        // racing past it.
+        Path codePath = Files.createDirectory(tempDir.resolve("race-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("race-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("race-fn-sha-v1");
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("race-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("race-fn-sha-v2");
+
+        when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
+
+        java.util.concurrent.CountDownLatch cleanupHoldingLock = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch releaseCleanup = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(inv -> {
+            cleanupHoldingLock.countDown();
+            // Blocks here while still holding volumeV1's per-volume lock, simulating a slow delete.
+            assertTrue(releaseCleanup.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                    "test did not release cleanup in time");
+            return null;
+        }).when(lifecycleManager).removeVolume(volumeV1);
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(v1);
+            launcher.launch(v2);
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+
+            Thread cleanupThread = new Thread(launcher::cleanupSupersededVolumes);
+            cleanupThread.start();
+            assertTrue(cleanupHoldingLock.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                    "cleanup never reached removeVolume");
+
+            java.util.concurrent.atomic.AtomicBoolean rollbackReturned =
+                    new java.util.concurrent.atomic.AtomicBoolean(false);
+            Thread rollbackThread = new Thread(() -> {
+                launcher.launch(v1);
+                rollbackReturned.set(true);
+            });
+            rollbackThread.start();
+
+            // Give the rollback every chance to (wrongly) proceed if the lock weren't shared.
+            Thread.sleep(200);
+            assertFalse(rollbackReturned.get(),
+                    "rollback must block while cleanup holds the volume's lock, not race past it");
+
+            releaseCleanup.countDown();
+            cleanupThread.join(5000);
+            rollbackThread.join(5000);
+            assertTrue(rollbackReturned.get(), "rollback should complete once cleanup releases the lock");
         } finally {
             ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
             ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
