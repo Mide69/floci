@@ -713,6 +713,102 @@ class ContainerLauncherTest {
         }
     }
 
+    @Test
+    void rollingBackToAPreviousCodeVersion_rescuesItsVolumeFromCleanup() throws Exception {
+        // Regression: v1 -> v2 -> back to v1 (e.g. a CloudFormation rollback) resolves v1's volume
+        // name again, which is already populated - a fast-path hit in ensureCodeVolume. Without
+        // reconciling functionCurrentVolume/volumesPendingCleanup on that path too, v1 would stay
+        // queued as superseded from the v1 -> v2 step and the next sweep would delete the volume
+        // this function is actively using again.
+        Path codePath = Files.createDirectory(tempDir.resolve("rollback-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("rollback-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("rollback-fn-sha-v1");
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("rollback-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("rollback-fn-sha-v2");
+        String volumeV2 = ContainerLauncher.codeVolumeName(v2);
+
+        // Needed for the rollback launch below: v1's volume is already populated by then, so its
+        // fast path actually evaluates volumeExists instead of short-circuiting past it.
+        when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(v1);
+            launcher.launch(v2);
+            launcher.launch(v1); // roll back
+
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+            verify(lifecycleManager, times(1)).removeVolume(volumeV2);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
+    }
+
+    @Test
+    void cleanupSupersededVolumes_retriesOnALaterSweep_whenTheVolumeIsStillInUse() throws Exception {
+        // Regression: removeVolume() silently no-ops when Docker refuses because the volume is
+        // still in use (e.g. a slow-draining in-flight container outliving the grace period). The
+        // pending-cleanup entry must not be discarded in that case, or the volume is orphaned until
+        // someone manually runs `docker volume prune`- the exact problem this fix exists to avoid.
+        Path codePath = Files.createDirectory(tempDir.resolve("retry-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("retry-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("retry-fn-sha-v1");
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("retry-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("retry-fn-sha-v2");
+
+        // v1's volume persists (still in use) no matter how many times removal is attempted.
+        when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(v1);
+            launcher.launch(v2);
+
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+
+            // A later sweep must still retry it, not have silently dropped it after the first
+            // no-op'd attempt.
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(2)).removeVolume(volumeV1);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
+    }
+
     /** Builds a tar archive matching what {@code docker cp}/{@code copyArchiveFromContainerCmd}
      *  returns for a directory: the directory itself as a leading entry, then each name as a direct
      *  child, executable. */
