@@ -18,6 +18,8 @@ import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServer;
 import io.github.hectorvent.floci.services.lambda.runtime.RuntimeApiServerFactory;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -107,6 +109,17 @@ public class ContainerLauncher {
         this.ecrRegistryManager = ecrRegistryManager;
         this.layerService = layerService;
         this.awsEnv = awsEnv;
+    }
+
+    @PostConstruct
+    void init() {
+        volumeCleanupScheduler.scheduleAtFixedRate(this::cleanupSupersededVolumes,
+                VOLUME_CLEANUP_GRACE_MS, VOLUME_CLEANUP_GRACE_MS, TimeUnit.MILLISECONDS);
+    }
+
+    @PreDestroy
+    void shutdown() {
+        volumeCleanupScheduler.shutdownNow();
     }
 
     /**
@@ -442,8 +455,36 @@ public class ContainerLauncher {
     // populated and a per-volume lock so a concurrent cold-start storm populates only once. The
     // lock entry is dropped after a successful populate so this map only ever holds in-flight
     // populates (see ensureCodeVolume) rather than growing across redeploys.
+    //
+    // This in-memory bookkeeping is a cache of Docker's actual state, not a source of truth: a
+    // volume manually removed mid-session (docker volume rm) or reclaimed by an out-of-band
+    // `docker volume prune` would otherwise still read as "populated" here even though Docker has
+    // nothing under that name, silently mounting an empty /var/task into the next container.
+    // ensureCodeVolume re-checks lifecycleManager.volumeExists() rather than trusting this alone.
     private final java.util.Set<String> populatedCodeVolumes = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.ConcurrentHashMap<String, Object> codeVolumeLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Each function's current code volume, so a redeploy can queue the superseded one for cleanup. */
+    private final java.util.concurrent.ConcurrentHashMap<String, String> functionCurrentVolume =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Superseded code volumes queued for cleanup, mapped to the time they were superseded (millis
+     * since epoch). Deletion is deferred rather than immediate: Docker auto-creates an empty named
+     * volume for a container mount that doesn't reference an existing one rather than failing, so a
+     * launch that resolved the old volume name just before a redeploy, but hasn't created its
+     * container yet, could otherwise be handed an empty /var/task by an immediate delete. Waiting
+     * out a grace period comfortably longer than a single container launch takes crosses that
+     * window safely; removeVolume() also no-ops if the volume is still genuinely in use by then.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> volumesPendingCleanup =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** Non-final and package-private, like {@link #CODE_VOLUME_MIN_BYTES}, so tests can shrink it
+     *  instead of waiting out a real 60s window (restore it in a finally). */
+    static long VOLUME_CLEANUP_GRACE_MS = 60_000L;
+    private final java.util.concurrent.ScheduledExecutorService volumeCleanupScheduler =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                    r -> { Thread t = new Thread(r, "floci-code-volume-cleanup"); t.setDaemon(true); return t; });
 
     /**
      * Returns the name of a read-only Docker volume holding this function's {@code /var/task} code,
@@ -453,12 +494,15 @@ public class ContainerLauncher {
      */
     private String ensureCodeVolume(LambdaFunction fn, String image) {
         String volName = codeVolumeName(fn);
-        if (populatedCodeVolumes.contains(volName)) {
+        if (populatedCodeVolumes.contains(volName) && lifecycleManager.volumeExists(volName)) {
             return volName;
         }
+        // Either never populated, or the bookkeeping says populated but Docker disagrees (removed
+        // out of band). Repopulate rather than trust a stale flag.
+        populatedCodeVolumes.remove(volName);
         Object lock = codeVolumeLocks.computeIfAbsent(volName, k -> new Object());
         synchronized (lock) {
-            if (populatedCodeVolumes.contains(volName)) {
+            if (populatedCodeVolumes.contains(volName) && lifecycleManager.volumeExists(volName)) {
                 return volName;
             }
             long t0 = System.currentTimeMillis();
@@ -475,11 +519,33 @@ public class ContainerLauncher {
             LOG.infov("Populated code volume {0} in {1}ms; future cold starts mount it instead of copying",
                     volName, System.currentTimeMillis() - t0);
         }
-        // We do NOT eagerly delete a function's previous code-version volume here: a concurrent
-        // in-flight launch may have already resolved that name and be about to mount it, so deleting
-        // it would give that container an empty /var/task. Stale volumes are labeled floci=true (see
-        // ContainerLifecycleManager.ensureVolume) and reclaimed by `docker volume prune --filter label=floci`.
+        String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
+        if (previous != null && !previous.equals(volName)) {
+            volumesPendingCleanup.put(previous, System.currentTimeMillis());
+        }
         return volName;
+    }
+
+    /**
+     * Removes superseded code volumes whose grace period has elapsed. Scheduled at the same
+     * interval as the grace period itself, so a volume is deleted within roughly one to two
+     * intervals of becoming superseded. Not a hard deadline, since this is best-effort cleanup,
+     * not a correctness requirement (a volume that outlives a few extra sweeps is still reclaimed by
+     * `docker volume prune --filter label=floci` same as before this existed).
+     */
+    void cleanupSupersededVolumes() {
+        long cutoff = System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS;
+        for (var entry : volumesPendingCleanup.entrySet()) {
+            if (entry.getValue() > cutoff) {
+                continue;
+            }
+            String volName = entry.getKey();
+            if (volumesPendingCleanup.remove(volName, entry.getValue())) {
+                populatedCodeVolumes.remove(volName);
+                lifecycleManager.removeVolume(volName);
+                LOG.debugv("Removed superseded code volume {0}", volName);
+            }
+        }
     }
 
     private void populateCodeVolume(String volName, LambdaFunction fn, String image) {

@@ -592,7 +592,9 @@ class ContainerLauncherTest {
         verify(lifecycleManager, times(2)).create(any());
         verify(lifecycleManager, atLeastOnce()).ensureVolume(any());
         verify(lifecycleManager, times(1)).stopAndRemove(any(), any()); // the helper only
-        // Old code-version volumes are NOT eagerly deleted (race fix); they are label-pruned instead.
+        // A superseded code-version volume is never deleted synchronously within a single launch
+        // (see the cleanupSupersededVolumes tests below for the deferred sweep; this fn has no
+        // prior volume to supersede, since it's the fn's first deploy here).
         verify(lifecycleManager, never()).removeVolume(any());
     }
 
@@ -629,6 +631,86 @@ class ContainerLauncherTest {
         // ...and we bailed before creating or starting any container (nothing to reap).
         verify(lifecycleManager, never()).create(any());
         verify(lifecycleManager, never()).startCreated(any(), any());
+    }
+
+    @Test
+    void launchFunction_reprovisionsCodeVolume_whenDockerHasNoRecordOfIt() throws Exception {
+        // Regression for #2164: the "populated" bookkeeping is only ever an in-memory cache of
+        // Docker's state, so a volume removed out of band (manual `docker volume rm`, or a stale
+        // in-memory flag left over from a process restart racing a prune) must not be trusted.
+        Path codePath = Files.createDirectory(tempDir.resolve("revalidate-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("revalidate-fn");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setCodeSha256("revalidate-fn-sha-v1");
+
+        // Docker never reports this volume as existing, simulating it being gone every time
+        // ensureCodeVolume checks, regardless of what the in-memory flag says.
+        when(lifecycleManager.volumeExists(anyString())).thenReturn(false);
+
+        long original = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(fn);
+            launcher.launch(fn);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = original;
+        }
+
+        // Populated twice, once per launch, because the bookkeeping alone is never trusted.
+        assertEquals(2, capturedRemotePaths.stream().filter("/var/task"::equals).count(),
+                "each launch should repopulate since Docker never confirms the volume exists");
+    }
+
+    @Test
+    void cleanupSupersededVolumes_removesPreviousVersionVolume_onceGracePeriodElapses() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("cleanup-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+        // No volumeExists stub needed: v1 and v2 are each a first-ever population of their own
+        // distinct volume name, so populatedCodeVolumes.contains(volName) is false both times
+        // ensureCodeVolume checks it, short-circuiting the volumeExists call away entirely.
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("cleanup-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("cleanup-fn-sha-v1");
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("cleanup-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("cleanup-fn-sha-v2");
+        String volumeV2 = ContainerLauncher.codeVolumeName(v2);
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(v1);
+            launcher.launch(v2);
+
+            // The v1 volume is superseded but not yet cleaned up: the grace period hasn't elapsed.
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+
+            // Once the grace period has (trivially) elapsed, the sweep removes exactly the
+            // superseded v1 volume, not the current v2 one.
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+            verify(lifecycleManager, never()).removeVolume(volumeV2);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
     }
 
     /** Builds a tar archive matching what {@code docker cp}/{@code copyArchiveFromContainerCmd}
