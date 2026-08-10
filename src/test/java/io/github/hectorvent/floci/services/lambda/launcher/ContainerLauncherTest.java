@@ -886,6 +886,93 @@ class ContainerLauncherTest {
     }
 
     @Test
+    void cleanupSkipsAVolumeStillInFlight_evenPastItsGracePeriod() throws Exception {
+        // Regression: a launch that has resolved its code volume (ensureCodeVolume returned, its
+        // per-volume lock released) but hasn't yet reached lifecycleManager.create() has no real
+        // Docker container-to-volume reference for removeVolume's own in-use check to protect - and
+        // create() itself has no proven upper bound (observed ~80s under daemon load, longer than
+        // the default 60s grace period). This forces a second launch of v1 to block right before
+        // create() while a redeploy to v2 supersedes its volume and the grace period is made to
+        // elapse instantly, then asserts cleanup does NOT delete v1's volume while that launch is
+        // still in flight - only once it completes and releases its reference.
+        Path codePath = Files.createDirectory(tempDir.resolve("inflight-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("inflight-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("inflight-fn-sha-v1");
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("inflight-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("inflight-fn-sha-v2");
+
+        // Needed for the delayed re-launch below: v1's volume is already populated by then, so its
+        // fast path actually evaluates volumeExists instead of short-circuiting past it.
+        when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+
+            // Pre-populate v1's volume with an ordinary launch, before installing the create()
+            // blocking stub below - otherwise that stub would catch populateCodeVolume's own
+            // helper-container create() call instead of the real container's.
+            launcher.launch(v1);
+
+            java.util.concurrent.CountDownLatch launchReachedCreate = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch releaseLaunch = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.atomic.AtomicBoolean blockedOnce = new java.util.concurrent.atomic.AtomicBoolean(false);
+            doAnswer(inv -> {
+                if (blockedOnce.compareAndSet(false, true)) {
+                    // Only the delayed re-launch of v1 (the first caller after this stub is
+                    // installed) blocks here; v2's later launch below must not, or the test would
+                    // deadlock itself waiting on its own main thread to release the latch.
+                    launchReachedCreate.countDown();
+                    assertTrue(releaseLaunch.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                            "test did not release the delayed launch in time");
+                }
+                return "container-123";
+            }).when(lifecycleManager).create(any());
+
+            Thread launchThread = new Thread(() -> launcher.launch(v1));
+            launchThread.start();
+            assertTrue(launchReachedCreate.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                    "v1's delayed re-launch never reached create()");
+
+            assertEquals(1, launcher.inFlightCount(volumeV1),
+                    "ensureCodeVolume must mark the volume in-flight before create() confirms it");
+
+            // A redeploy resolves v2 and supersedes v1's volume while v1's own launch is still stuck.
+            launcher.launch(v2);
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1; // grace period elapses instantly
+
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, never()).removeVolume(volumeV1);
+
+            // Let the delayed launch finish; it releases its in-flight reference on success.
+            releaseLaunch.countDown();
+            launchThread.join(5000);
+            assertEquals(0, launcher.inFlightCount(volumeV1),
+                    "in-flight count must be released once create() succeeds");
+
+            // Nothing is in flight anymore, so a later sweep is free to actually delete it.
+            launcher.cleanupSupersededVolumes();
+            verify(lifecycleManager, times(1)).removeVolume(volumeV1);
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
+    }
+
+    @Test
     void codeVolumeLocks_isNeverPruned_evenAfterCleanupDeletesTheVolume() throws Exception {
         // Regression: pruning a volume's lock entry while a waiter still held a reference to the
         // removed entry's lock object let a third caller's computeIfAbsent create a *different* lock

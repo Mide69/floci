@@ -172,6 +172,10 @@ public class ContainerLauncher {
         // runtime-api port per failed attempt and eventually exhausts the pool, so launches keep
         // failing even after the daemon recovers.
         String containerId = null;
+        // Hoisted alongside containerId, for the same reason: the resolved volume name (if any)
+        // must be visible in the catch block below to release its in-flight reference on any
+        // failure path, not just the one where useCodeVolume's block itself throws.
+        String reservedCodeVolume = null;
         try {
 
         // Resolve image
@@ -263,8 +267,8 @@ public class ContainerLauncher {
                 // overlay I/O) and, run many-at-once, saturated the daemon so even `docker create`
                 // ballooned to ~80s. A pre-populated volume mounts in ~0.2s and is shared read-only
                 // by all containers of the function — matching AWS, where /var/task is read-only.
-                String codeVolume = ensureCodeVolume(fn, image);
-                specBuilder.withNamedVolume(codeVolume, TASK_DIR, true);
+                reservedCodeVolume = ensureCodeVolume(fn, image);
+                specBuilder.withNamedVolume(reservedCodeVolume, TASK_DIR, true);
             }
             // Small code takes the original per-container direct copy below (no volume): it's fast
             // enough that a shared volume's helper round-trip would only add cold-start latency.
@@ -300,6 +304,11 @@ public class ContainerLauncher {
         // /var/runtime/bootstrap on start, so code must be copied first.
         containerId = lifecycleManager.create(spec);
         LOG.infov("Created container {0} for function {1}", containerId, fn.getFunctionName());
+        // Docker now holds the real container-to-volume reference, which removeVolume's own in-use
+        // check protects from here on - release the in-flight marker that stood in for it before
+        // this point, and null it out so the catch block below doesn't release it a second time.
+        releaseCodeVolumeReference(reservedCodeVolume);
+        reservedCodeVolume = null;
 
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
@@ -400,6 +409,10 @@ public class ContainerLauncher {
             if (containerId != null) {
                 try { lifecycleManager.stopAndRemove(containerId, null); } catch (Exception ignore) { /* best effort */ }
             }
+            // No-op if create() already succeeded and released this above (reservedCodeVolume is
+            // null by then); otherwise the failure happened before Docker ever saw the volume, so
+            // its in-flight reference must be released here or cleanup would wait on it forever.
+            releaseCodeVolumeReference(reservedCodeVolume);
             try { runtimeApiServerFactory.release(runtimeApiServer); } catch (Exception ignore) { /* best effort */ }
             throw e;
         }
@@ -486,6 +499,20 @@ public class ContainerLauncher {
      */
     private final java.util.concurrent.ConcurrentHashMap<String, Long> volumesPendingCleanup =
             new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Counts launches that hold a resolved volume name but haven't yet handed it to Docker via
+     * {@code create()} - i.e. no real container-to-volume reference exists yet for Docker's own
+     * in-use check to protect. The grace period in {@link #volumesPendingCleanup} assumes a launch
+     * completes create() well within it, but create() itself has no proven upper bound (observed
+     * up to ~80s under daemon load, longer than the default 60s grace period), so a slow launch can
+     * still be mid-flight when a sweep would otherwise delete its volume. cleanupSupersededVolumes
+     * re-queues rather than deletes while a volume's count here is nonzero, regardless of elapsed
+     * time. Entries are removed once their count returns to zero, so this stays bounded like the
+     * other per-volume maps.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger> volumesInFlight =
+            new java.util.concurrent.ConcurrentHashMap<>();
     /** Non-final and package-private, like {@link #CODE_VOLUME_MIN_BYTES}, so tests can shrink it
      *  instead of waiting out a real 60s window (restore it in a finally). */
     static long VOLUME_CLEANUP_GRACE_MS = 60_000L;
@@ -535,8 +562,27 @@ public class ContainerLauncher {
             if (previous != null && !previous.equals(volName)) {
                 volumesPendingCleanup.put(previous, System.currentTimeMillis());
             }
+            // Mark this volume as having an unconfirmed reference before releasing the lock: the
+            // caller now holds this name but hasn't handed it to Docker yet, so a sweep that acquires
+            // this same lock next must see the increment and skip deleting it. The caller releases
+            // this via releaseCodeVolumeReference once create() succeeds (or the launch fails).
+            volumesInFlight.computeIfAbsent(volName, k -> new java.util.concurrent.atomic.AtomicInteger())
+                    .incrementAndGet();
         }
         return volName;
+    }
+
+    /**
+     * Releases the in-flight reference {@link #ensureCodeVolume} placed on {@code volName}. Safe to
+     * call with {@code null} (nothing was reserved) and idempotent bookkeeping-wise: the counter
+     * only ever reflects reservations actually made, since callers null out their local reference
+     * after releasing it (see {@link #launch}).
+     */
+    private void releaseCodeVolumeReference(String volName) {
+        if (volName == null) {
+            return;
+        }
+        volumesInFlight.computeIfPresent(volName, (k, count) -> count.decrementAndGet() > 0 ? count : null);
     }
 
     /**
@@ -564,6 +610,16 @@ public class ContainerLauncher {
                 if (stillQueuedAt == null || stillQueuedAt > cutoff) {
                     continue;
                 }
+                java.util.concurrent.atomic.AtomicInteger inFlight = volumesInFlight.get(volName);
+                if (inFlight != null && inFlight.get() > 0) {
+                    // A launch has resolved this volume but hasn't handed it to Docker yet, so no
+                    // real container-to-volume reference exists for removeVolume's own in-use check
+                    // to catch. The grace period alone isn't a safe upper bound on that launch's
+                    // duration (create() has been observed taking ~80s under daemon load), so requeue
+                    // for a later sweep instead of trusting elapsed time here.
+                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
+                    continue;
+                }
                 volumesPendingCleanup.remove(volName, stillQueuedAt);
                 if (lifecycleManager.removeVolume(volName)) {
                     populatedCodeVolumes.remove(volName);
@@ -584,6 +640,12 @@ public class ContainerLauncher {
     /** Test-only: whether a per-volume lock object has ever been created for this volume name. */
     boolean hasCodeVolumeLock(String volName) {
         return codeVolumeLocks.containsKey(volName);
+    }
+
+    /** Test-only: the current in-flight reference count for this volume name (0 if none). */
+    int inFlightCount(String volName) {
+        java.util.concurrent.atomic.AtomicInteger count = volumesInFlight.get(volName);
+        return count == null ? 0 : count.get();
     }
 
     private void populateCodeVolume(String volName, LambdaFunction fn, String image) {
