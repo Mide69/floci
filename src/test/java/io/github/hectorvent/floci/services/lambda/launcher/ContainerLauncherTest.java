@@ -787,7 +787,7 @@ class ContainerLauncherTest {
         v2.setCodeSha256("retry-fn-sha-v2");
 
         // v1's volume persists (still in use) no matter how many times removal is attempted.
-        when(lifecycleManager.volumeExists(volumeV1)).thenReturn(true);
+        when(lifecycleManager.removeVolume(volumeV1)).thenReturn(false);
 
         long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
         long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;

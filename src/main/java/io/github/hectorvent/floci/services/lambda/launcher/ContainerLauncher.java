@@ -565,16 +565,17 @@ public class ContainerLauncher {
                     continue;
                 }
                 volumesPendingCleanup.remove(volName, stillQueuedAt);
-                lifecycleManager.removeVolume(volName);
-                if (lifecycleManager.volumeExists(volName)) {
-                    // Still in use (e.g. a slow-draining in-flight container outlived the grace
-                    // period) - removeVolume() silently no-ops on that rather than signalling it, so
-                    // without this the entry would be lost with no later sweep ever retrying it.
-                    // Leave populatedCodeVolumes alone, since the volume is still there and valid.
-                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
-                } else {
+                if (lifecycleManager.removeVolume(volName)) {
                     populatedCodeVolumes.remove(volName);
                     LOG.debugv("Removed superseded code volume {0}", volName);
+                } else {
+                    // Not confirmed gone: still in use (e.g. a slow-draining in-flight container
+                    // outlived the grace period), or the removal attempt itself failed for some
+                    // other reason (e.g. a transient daemon error). Either way, without this the
+                    // entry would be lost with no later sweep ever retrying it. Leave
+                    // populatedCodeVolumes alone too, since for all we know it's still there and
+                    // still valid.
+                    volumesPendingCleanup.put(volName, System.currentTimeMillis());
                 }
             }
         }
