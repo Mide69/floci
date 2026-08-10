@@ -452,9 +452,9 @@ public class ContainerLauncher {
 
     // Per-function-version code volumes: populated once, then mounted read-only into every
     // container so cold starts skip the ~95s node_modules copy. Tracks which volumes are already
-    // populated and a per-volume lock so a concurrent cold-start storm populates only once. The
-    // lock entry is dropped after a successful populate so this map only ever holds in-flight
-    // populates (see ensureCodeVolume) rather than growing across redeploys.
+    // populated and a per-volume lock so a concurrent cold-start storm populates only once - and so
+    // ensureCodeVolume's bookkeeping and cleanupSupersededVolumes' claim-and-delete for the same
+    // volume name can never interleave (see both call sites).
     //
     // This in-memory bookkeeping is a cache of Docker's actual state, not a source of truth: a
     // volume manually removed mid-session (docker volume rm) or reclaimed by an out-of-band
@@ -462,6 +462,13 @@ public class ContainerLauncher {
     // nothing under that name, silently mounting an empty /var/task into the next container.
     // ensureCodeVolume re-checks lifecycleManager.volumeExists() rather than trusting this alone.
     private final java.util.Set<String> populatedCodeVolumes = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    // Deliberately never pruned: removing an entry while a caller elsewhere still held a reference
+    // to its lock object let a third caller's computeIfAbsent create a replacement lock for the same
+    // volume name, so the waiter (once granted the old lock) and the new caller (holding the new
+    // one) could run their supposedly-exclusive sections concurrently - the exact race this map
+    // exists to prevent. Bounded in practice by the number of distinct function+code-version
+    // combinations ever launched, each entry a single Object; negligible next to the disk space the
+    // rest of this fix reclaims.
     private final java.util.concurrent.ConcurrentHashMap<String, Object> codeVolumeLocks = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Each function's current code volume, so a redeploy can queue the superseded one for cleanup. */
@@ -501,7 +508,10 @@ public class ContainerLauncher {
         // (rescued-from-cleanup, or actually-gone-and-needs-repopulating) rather than acting on
         // stale state. Population itself is the only expensive part, and it happens at most once
         // per code version regardless, so holding this for cheap map bookkeeping too costs nothing
-        // meaningful.
+        // meaningful. codeVolumeLocks is never pruned (see the comment on that field): removing an
+        // entry while a waiter still held a reference to its lock object let a third caller create a
+        // replacement lock for the same name and run concurrently with the waiter once released,
+        // defeating this exclusion entirely.
         Object lock = codeVolumeLocks.computeIfAbsent(volName, k -> new Object());
         synchronized (lock) {
             if (!(populatedCodeVolumes.contains(volName) && lifecycleManager.volumeExists(volName))) {
@@ -525,11 +535,6 @@ public class ContainerLauncher {
             if (previous != null && !previous.equals(volName)) {
                 volumesPendingCleanup.put(previous, System.currentTimeMillis());
             }
-            // Bound codeVolumeLocks so it only ever holds locks genuinely in use, not one per
-            // redeploy ever seen. Safe: the next caller's computeIfAbsent gets a fresh lock object,
-            // but correctness comes from re-checking populatedCodeVolumes/volumesPendingCleanup state
-            // under whatever lock is currently held, not from a lock object's identity persisting.
-            codeVolumeLocks.remove(volName);
         }
         return volName;
     }
@@ -557,7 +562,6 @@ public class ContainerLauncher {
                 // timestamp between the check above and acquiring this lock.
                 Long stillQueuedAt = volumesPendingCleanup.get(volName);
                 if (stillQueuedAt == null || stillQueuedAt > cutoff) {
-                    codeVolumeLocks.remove(volName);
                     continue;
                 }
                 volumesPendingCleanup.remove(volName, stillQueuedAt);
@@ -572,9 +576,13 @@ public class ContainerLauncher {
                     populatedCodeVolumes.remove(volName);
                     LOG.debugv("Removed superseded code volume {0}", volName);
                 }
-                codeVolumeLocks.remove(volName);
             }
         }
+    }
+
+    /** Test-only: whether a per-volume lock object has ever been created for this volume name. */
+    boolean hasCodeVolumeLock(String volName) {
+        return codeVolumeLocks.containsKey(volName);
     }
 
     private void populateCodeVolume(String volName, LambdaFunction fn, String image) {

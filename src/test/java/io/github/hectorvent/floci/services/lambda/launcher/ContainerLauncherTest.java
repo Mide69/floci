@@ -885,6 +885,55 @@ class ContainerLauncherTest {
         }
     }
 
+    @Test
+    void codeVolumeLocks_isNeverPruned_evenAfterCleanupDeletesTheVolume() throws Exception {
+        // Regression: pruning a volume's lock entry while a waiter still held a reference to the
+        // removed entry's lock object let a third caller's computeIfAbsent create a *different* lock
+        // object for the same volume name, so the waiter (once granted the old lock) and that third
+        // caller (holding the new one) could run their supposedly mutually-exclusive sections
+        // concurrently - defeating the whole point. The actual JVM interleaving needed to trigger
+        // that is timing-dependent and not reliably forceable in a test, so this instead verifies the
+        // fix's real invariant directly: the lock entry must survive a full populate-then-delete
+        // cycle unchanged, which is what actually guarantees computeIfAbsent always returns the same
+        // object for a given volume name for the life of the process.
+        Path codePath = Files.createDirectory(tempDir.resolve("lock-persist-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("lock-persist-fn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("lock-persist-fn-sha-v1");
+        String volumeV1 = ContainerLauncher.codeVolumeName(v1);
+
+        LambdaFunction v2 = new LambdaFunction();
+        v2.setFunctionName("lock-persist-fn");
+        v2.setRuntime("nodejs20.x");
+        v2.setHandler("index.handler");
+        v2.setCodeLocalPath(codePath.toString());
+        v2.setCodeSha256("lock-persist-fn-sha-v2");
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        long originalGrace = ContainerLauncher.VOLUME_CLEANUP_GRACE_MS;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+            launcher.launch(v1);
+            assertTrue(launcher.hasCodeVolumeLock(volumeV1), "lock must exist right after populate");
+
+            launcher.launch(v2); // supersedes v1's volume, queues it for cleanup
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = -1;
+            launcher.cleanupSupersededVolumes(); // deletes v1's volume for real
+
+            assertTrue(launcher.hasCodeVolumeLock(volumeV1),
+                    "lock must still exist even after the volume itself was deleted - "
+                            + "pruning it here is exactly the bug this test guards against");
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+            ContainerLauncher.VOLUME_CLEANUP_GRACE_MS = originalGrace;
+        }
+    }
+
     /** Builds a tar archive matching what {@code docker cp}/{@code copyArchiveFromContainerCmd}
      *  returns for a directory: the directory itself as a leading entry, then each name as a direct
      *  child, executable. */
