@@ -370,6 +370,29 @@ class Ec2ContainerManagerTest {
         awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
     }
 
+    @Test
+    void launchWithoutKeyPairStillStartsSshd() throws Exception {
+        // Regression for #2184: sshd previously only started when a key pair was supplied, so
+        // run-instances without --key-name left no daemon listening at all ("connection refused")
+        // instead of matching real AWS AMIs, which run sshd as part of normal boot regardless of
+        // whether a key pair is attached to the instance.
+        LaunchHarness harness = launchHarness();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse withIp = inspectResponse("172.18.0.20");
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(withIp);
+        harness.stubSuccessfulExecs(new CountDownLatch(0), new CountDownLatch(0));
+        Instance instance = instance("i-nokeypair");
+
+        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+
+        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
+        ExecCreateCmd execCreate = harness.dockerClient.execCreateCmd(TEST_CONTAINER_ID);
+        verify(execCreate, timeout(2000)).withCmd(eq(new String[]{"/usr/sbin/sshd"}));
+        // No key pair was supplied, so nothing should have been written to authorized_keys.
+        verify(harness.dockerClient, never()).copyArchiveToContainerCmd(TEST_CONTAINER_ID);
+    }
+
     private static LaunchHarness launchHarness() {
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
         ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, withSettings().defaultAnswer(RETURNS_SELF));

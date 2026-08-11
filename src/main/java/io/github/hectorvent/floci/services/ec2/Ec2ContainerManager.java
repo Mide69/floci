@@ -217,11 +217,16 @@ public class Ec2ContainerManager {
                     portForwardManager.reconcile(instance, appPorts);
                 }
 
-                // Inject SSH public key
+                // Inject SSH public key, if one was provided
                 if (publicKey != null && !publicKey.isBlank()) {
                     injectSshKey(containerId, publicKey);
-                    startSshd(containerId, instanceId);
                 }
+                // sshd runs on every instance regardless of whether a key pair was supplied,
+                // matching real AWS AMIs (which start it as part of normal boot, independent of
+                // key-pair association) - starting it only when a key was present meant
+                // run-instances without --key-name produced a "connection refused" instead of AWS's
+                // actual behavior: a running daemon with simply nothing to authenticate against.
+                startSshd(containerId, instanceId);
 
                 // Execute UserData
                 String userData = instance.getUserData();
