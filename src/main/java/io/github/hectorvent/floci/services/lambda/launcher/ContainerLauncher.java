@@ -489,6 +489,20 @@ public class ContainerLauncher {
             new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
+     * Serializes the functionCurrentVolume/volumesPendingCleanup transition below, keyed by function
+     * name rather than volume name. Two code versions of the same function resolve to two different
+     * volume names, so they hold two different codeVolumeLocks entries and can run that per-volume
+     * critical section concurrently - which is fine for the populate work, but not for this
+     * transition: without a shared lock, a rapid back-to-back redeploy (v2 then v3) can have v2's
+     * functionCurrentVolume.put land after v3's, leaving v3 - the actually-current volume - recorded
+     * as superseded and queued for cleanup while stale v2 is left marked current. Never pruned, for
+     * the same lock-identity reason as codeVolumeLocks, and bounded the same way (one entry per
+     * distinct function name ever launched).
+     */
+    private final java.util.concurrent.ConcurrentHashMap<String, Object> functionVolumeTransitionLocks =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
      * Superseded code volumes queued for cleanup, mapped to the time they were superseded (millis
      * since epoch). Deletion is deferred rather than immediate: Docker auto-creates an empty named
      * volume for a container mount that doesn't reference an existing one rather than failing, so a
@@ -557,10 +571,20 @@ public class ContainerLauncher {
             // that's already populated but may have been queued as superseded by the deploy this
             // just rolled back. Without pulling it back out of volumesPendingCleanup and marking it
             // current again, the next sweep would delete the volume this function is actively using.
-            volumesPendingCleanup.remove(volName);
-            String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
-            if (previous != null && !previous.equals(volName)) {
-                volumesPendingCleanup.put(previous, System.currentTimeMillis());
+            //
+            // Under the per-function lock too: this specific read-modify-write (put, then queue
+            // whatever was previously current) must be atomic across different code versions of the
+            // same function, or two concurrent resolves can interleave their put()/queue steps and
+            // leave the actually-current volume queued for cleanup instead of the stale one - see the
+            // comment on functionVolumeTransitionLocks.
+            Object functionLock = functionVolumeTransitionLocks.computeIfAbsent(
+                    fn.getFunctionName(), k -> new Object());
+            synchronized (functionLock) {
+                volumesPendingCleanup.remove(volName);
+                String previous = functionCurrentVolume.put(fn.getFunctionName(), volName);
+                if (previous != null && !previous.equals(volName)) {
+                    volumesPendingCleanup.put(previous, System.currentTimeMillis());
+                }
             }
             // Mark this volume as having an unconfirmed reference before releasing the lock: the
             // caller now holds this name but hasn't handed it to Docker yet, so a sweep that acquires
@@ -640,6 +664,15 @@ public class ContainerLauncher {
     /** Test-only: whether a per-volume lock object has ever been created for this volume name. */
     boolean hasCodeVolumeLock(String volName) {
         return codeVolumeLocks.containsKey(volName);
+    }
+
+    /**
+     * Test-only: the same lock object ensureCodeVolume synchronizes on for this function's
+     * current-volume transition, so a test can hold it directly to prove a concurrent launch blocks
+     * on it rather than racing past it.
+     */
+    Object functionVolumeTransitionLockFor(String functionName) {
+        return functionVolumeTransitionLocks.computeIfAbsent(functionName, k -> new Object());
     }
 
     /** Test-only: the current in-flight reference count for this volume name (0 if none). */

@@ -973,6 +973,74 @@ class ContainerLauncherTest {
     }
 
     @Test
+    void concurrentRedeploysOfTheSameFunction_serializeTheCurrentVolumeTransition() throws Exception {
+        // Regression: functionCurrentVolume/volumesPendingCleanup reconciliation ran under the
+        // per-volume lock only, but two code versions of the same function resolve to two different
+        // volume names and so hold two different per-volume locks - meaning that reconciliation
+        // could interleave across a rapid back-to-back redeploy (v2 then v3), leaving the actually-
+        // current v3 volume mistakenly queued for cleanup while stale v2 stayed recorded as current.
+        // The three statements involved (remove pending-cleanup entry, swap in the new current
+        // volume, queue whatever was displaced) are plain map operations with no interception point
+        // inside them, so forcing that exact interleaving isn't reliably doable in a test. This
+        // instead verifies the fix's actual mechanism directly - a concurrent launch for a second
+        // code version of the same function must block on the same per-function lock object while
+        // another is still transitioning - the same style cleanupAndAConcurrentRollback... already
+        // uses to prove the per-volume lock.
+        Path codePath = Files.createDirectory(tempDir.resolve("xfn-code"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]); // 8 KiB
+
+        LambdaFunction v1 = new LambdaFunction();
+        v1.setFunctionName("xfn");
+        v1.setRuntime("nodejs20.x");
+        v1.setHandler("index.handler");
+        v1.setCodeLocalPath(codePath.toString());
+        v1.setCodeSha256("xfn-sha-v1");
+
+        long originalBytes = ContainerLauncher.CODE_VOLUME_MIN_BYTES;
+        try {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = 4 * 1024;
+
+            Object functionLock = launcher.functionVolumeTransitionLockFor("xfn");
+            java.util.concurrent.CountDownLatch testHoldingLock = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch releaseLock = new java.util.concurrent.CountDownLatch(1);
+            Thread holderThread = new Thread(() -> {
+                synchronized (functionLock) {
+                    testHoldingLock.countDown();
+                    try {
+                        assertTrue(releaseLock.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                                "test did not release the function lock in time");
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            holderThread.start();
+            assertTrue(testHoldingLock.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                    "test thread never acquired the function lock");
+
+            AtomicBoolean launchReturned = new AtomicBoolean(false);
+            Thread launchThread = new Thread(() -> {
+                launcher.launch(v1);
+                launchReturned.set(true);
+            });
+            launchThread.start();
+
+            // Give the launch every chance to (wrongly) proceed if the transition weren't guarded
+            // by this same lock.
+            Thread.sleep(200);
+            assertFalse(launchReturned.get(),
+                    "launch must block on the function lock while another holder has it, not race past it");
+
+            releaseLock.countDown();
+            holderThread.join(5000);
+            launchThread.join(5000);
+            assertTrue(launchReturned.get(), "launch should complete once the function lock is released");
+        } finally {
+            ContainerLauncher.CODE_VOLUME_MIN_BYTES = originalBytes;
+        }
+    }
+
+    @Test
     void codeVolumeLocks_isNeverPruned_evenAfterCleanupDeletesTheVolume() throws Exception {
         // Regression: pruning a volume's lock entry while a waiter still held a reference to the
         // removed entry's lock object let a third caller's computeIfAbsent create a *different* lock
