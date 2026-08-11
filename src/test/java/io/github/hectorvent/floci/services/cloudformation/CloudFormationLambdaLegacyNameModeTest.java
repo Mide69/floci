@@ -11,9 +11,11 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -105,6 +107,70 @@ class CloudFormationLambdaLegacyNameModeTest {
         assertEquals(legacyGeneratedName, result.getPhysicalId());
         verify(lambdaService, never()).createFunction(anyString(), anyMap());
         verify(lambdaService, never()).deleteFunction(anyString(), anyString());
+    }
+
+    @Test
+    void legacyGeneratedFunctionNameWithNoRecordedMode_warnsAboutTheAmbiguousInference() {
+        // Regression: inferring "generated" for a legacy name that happens to match the generated
+        // shape is a guess Floci cannot verify - if the name was actually pinned explicitly, this
+        // inference silently suppresses the replacement AWS would perform. There's no way to close
+        // that gap (the raw historical property value was never persisted to check against), so this
+        // instead verifies the guess is at least observable: a warning logged specifically when the
+        // inference is consequential (current template also has no FunctionName).
+        String legacyGeneratedName = STACK_NAME + "-Function-abc123def456";
+        when(lambdaService.getFunction(REGION, legacyGeneratedName)).thenReturn(lambdaFunction(legacyGeneratedName));
+
+        List<String> messages = provisionerLogMessages(() -> provision("{}", legacyGeneratedName, Map.of()));
+
+        assertTrue(messages.stream().anyMatch(m ->
+                        m.contains("auto-generated because it matches the generated-name shape")),
+                "expected a warning about the ambiguous legacy-name inference, got: " + messages);
+    }
+
+    @Test
+    void legacyExplicitFunctionNameWithNoRecordedMode_doesNotWarn() {
+        // The other inference direction (legacy name does NOT match the generated shape, so it's
+        // treated as explicit) has no real ambiguity - an auto-generated name always has the
+        // deterministic shape, so anything else genuinely must have been explicit. No warning should
+        // fire for what is actually the safe, unambiguous, common case.
+        String legacyExplicitName = "my-hand-chosen-function";
+        when(lambdaService.getFunction(REGION, legacyExplicitName)).thenReturn(lambdaFunction(legacyExplicitName));
+        when(lambdaService.createFunction(anyString(), anyMap()))
+                .thenAnswer(inv -> lambdaFunction((String) ((Map<?, ?>) inv.getArgument(1)).get("FunctionName")));
+
+        List<String> messages = provisionerLogMessages(() -> provision("{}", legacyExplicitName, Map.of()));
+
+        assertFalse(messages.stream().anyMatch(m ->
+                        m.contains("auto-generated because it matches the generated-name shape")),
+                "did not expect a warning for the unambiguous explicit-name case, got: " + messages);
+    }
+
+    /** Collects the messages CloudFormationResourceProvisioner logs while {@code action} runs. */
+    private List<String> provisionerLogMessages(Runnable action) {
+        java.util.logging.Logger logger =
+                java.util.logging.Logger.getLogger(CloudFormationResourceProvisioner.class.getName());
+        List<String> messages = new CopyOnWriteArrayList<>();
+        java.util.logging.Handler handler = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord logRecord) {
+                messages.add(logRecord.getMessage());
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        logger.addHandler(handler);
+        try {
+            action.run();
+        } finally {
+            logger.removeHandler(handler);
+        }
+        return messages;
     }
 
     private StackResource provision(String propertiesJson, String existingPhysicalId,
