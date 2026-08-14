@@ -54,7 +54,7 @@ class CloudFormationLambdaLegacyNameModeTest {
                 mapper,
                 null, null, null, null, null, null, null,
                 null, null, null, null, null, null, null,
-                null,
+                null, null,
                 new CloudFormationResourceRegistry(List.of()));
     }
 
