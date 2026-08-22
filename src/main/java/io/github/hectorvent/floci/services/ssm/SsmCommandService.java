@@ -277,9 +277,13 @@ public class SsmCommandService implements Resettable {
             });
         }
 
-        command.setStatus("Cancelled");
-        command.setStatusDetails("Cancelled");
-        commandStore.put(commandKey(region, commandId), command);
+        // Same lock updateCommandStatus takes on this exact object, so a rollup completing this
+        // command concurrently can't have its own status+statusDetails write interleave with this one.
+        synchronized (command) {
+            command.setStatus("Cancelled");
+            command.setStatusDetails("Cancelled");
+            commandStore.put(commandKey(region, commandId), command);
+        }
         LOG.infov("CancelCommand: commandId={0}", commandId);
     }
 
@@ -683,23 +687,30 @@ public class SsmCommandService implements Resettable {
             }
         }
 
-        command.setCompletedCount(completed);
-        command.setErrorCount(errors);
+        // Synchronized on the shared Command object itself (commandStore's get() always returns the
+        // same instance for a given key, not a defensive copy) so this status+statusDetails write
+        // can't interleave with cancelCommand's own status+statusDetails write on the same object -
+        // without this, cancelCommand's whole pair could land inside the gap between this method's
+        // two field writes, leaving status=Cancelled but statusDetails reflecting this call's stale
+        // completion status (or the reverse), even though each method's own two fields individually
+        // agree with each other when read right after being written.
+        synchronized (command) {
+            command.setCompletedCount(completed);
+            command.setErrorCount(errors);
 
-        if (!anyInProgress && completed == instanceIds.size()) {
-            // Use the local status, not a re-read of command.getStatus(): commandStore is a plain
-            // ConcurrentHashMap-backed InMemoryStorage whose get() returns the same shared Command
-            // object on every call, not a defensive copy. Re-reading it here left a window between
-            // the two lines where a concurrent updateCommandStatus call for the same command (e.g.
-            // another instance's async completion racing this one) could mutate that shared object
-            // in between, so this call's own statusDetails ended up reflecting a DIFFERENT thread's
-            // status than the one it just wrote to status itself.
-            String status = commandStatus(errors, timedOut, instanceIds.size());
-            command.setStatus(status);
-            command.setStatusDetails(statusDetails(status));
+            if (!anyInProgress && completed == instanceIds.size()) {
+                // Use the local status, not a re-read of command.getStatus(): re-reading it here left
+                // a second, narrower window where a concurrent updateCommandStatus call for the same
+                // command (e.g. another instance's async completion racing this one) could mutate the
+                // shared object in between, so this call's own statusDetails ended up reflecting a
+                // DIFFERENT call's status than the one it had just written to status itself.
+                String status = commandStatus(errors, timedOut, instanceIds.size());
+                command.setStatus(status);
+                command.setStatusDetails(statusDetails(status));
+            }
+
+            commandStore.put(commandKey(region, commandId), command);
         }
-
-        commandStore.put(commandKey(region, commandId), command);
     }
 
     private static String commandStatus(int errors, int timedOut, int targetCount) {
