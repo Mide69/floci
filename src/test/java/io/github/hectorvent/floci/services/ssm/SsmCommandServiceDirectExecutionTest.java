@@ -2,6 +2,8 @@ package io.github.hectorvent.floci.services.ssm;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -12,10 +14,13 @@ import io.github.hectorvent.floci.services.ssm.model.CommandInvocation;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -201,6 +206,71 @@ class SsmCommandServiceDirectExecutionTest {
         assertEquals("Execution Timed Out", invocation.getStatusDetails());
         assertEquals(-1, invocation.getResponseCode());
         assertEquals("Timed out after 30s", invocation.getStandardErrorContent());
+    }
+
+    @Test
+    void concurrentInstanceCompletions_neverLeaveStatusAndStatusDetailsInconsistent() throws Exception {
+        // Regression for #2264: commandStore is a plain ConcurrentHashMap-backed InMemoryStorage
+        // whose get() returns the SAME shared Command object on every call, not a defensive copy. A
+        // multi-instance command's last two instances completing at (nearly) the same moment can both
+        // observe "all done" and both enter updateCommandStatus's finalize branch concurrently on that
+        // one shared object. The finalize branch used to re-read command.getStatus() instead of the
+        // local variable it had just computed, so whichever thread's write landed last could leave
+        // statusDetails reflecting a DIFFERENT status than the one actually stored - exactly the
+        // reported symptom (status=TimedOut, statusDetails=In Progress).
+        //
+        // A CyclicBarrier forces every instance's mocked completion to release as close to
+        // simultaneously as Java threads allow, with many instances (not just two) and many trials
+        // to make several concurrently reaching the finalize branch as likely as this test can make
+        // it. In practice even 1200 such attempts (12 instances x 100 trials) never landed a thread
+        // exactly between the old code's setStatus() and its re-read of getStatus() - that gap is a
+        // few nanoseconds of adjacent bytecode, far narrower than normal thread-scheduling
+        // granularity in a clean, uncontended test JVM. That matches the issue's own report (passes
+        // locally, only flakes under real CI load, where GC pauses and dozens of other tests
+        // competing for CPU create far more scheduling noise than this test can reproduce alone).
+        // This test therefore isn't a fails-before/passes-after reproduction of the historical bug;
+        // it's a standing invariant check that concurrent completions never leave status and
+        // statusDetails disagreeing, which the fix satisfies by construction: statusDetails is now
+        // computed from a local variable no other thread can touch, so the specific TOCTOU window
+        // is closed regardless of scheduling, not merely made statistically unlikely to hit.
+        int instanceCount = 12;
+        int trials = 100;
+        for (int trial = 0; trial < trials; trial++) {
+            SsmDirectCommandExecutor executor = mock(SsmDirectCommandExecutor.class);
+            Instant start = Instant.parse("2026-06-07T00:00:00Z");
+            Instant end = Instant.parse("2026-06-07T00:00:01Z");
+            CyclicBarrier barrier = new CyclicBarrier(instanceCount);
+            List<String> instanceIds = new ArrayList<>();
+            for (int i = 0; i < instanceCount; i++) {
+                String instanceId = "i-" + i;
+                instanceIds.add(instanceId);
+                when(executor.supports(eq(instanceId), eq("AWS-RunShellScript"))).thenReturn(true);
+                when(executor.executeIfSupported(eq(instanceId), eq("AWS-RunShellScript"), any(), eq(60)))
+                        .thenAnswer(invocation -> {
+                            barrier.await(5, TimeUnit.SECONDS);
+                            return Optional.of(new SsmDirectCommandExecutor.ExecutionResult(
+                                    "Success", "done\n", "", 0, start, end));
+                        });
+            }
+
+            SsmCommandService service = new SsmCommandService(
+                    new InMemoryStorageFactory(), objectMapper, regionResolver, executor);
+
+            ObjectNode request = objectMapper.createObjectNode();
+            ArrayNode instanceIdsNode = request.putArray("InstanceIds");
+            instanceIds.forEach(instanceIdsNode::add);
+            request.put("DocumentName", "AWS-RunShellScript");
+            request.putObject("Parameters").putArray("commands").add("echo hi");
+            request.put("TimeoutSeconds", 60);
+
+            Command command = service.sendCommand(request, "us-west-2");
+
+            String finalStatus = waitForCommandStatus(service, command.getCommandId(), "us-west-2");
+            Command updated = service.listCommands(command.getCommandId(), null, "us-west-2").getFirst();
+            assertEquals("Success", finalStatus, "trial " + trial + ": command status");
+            assertEquals("Success", updated.getStatus(), "trial " + trial + ": command status on re-fetch");
+            assertEquals("Success", updated.getStatusDetails(), "trial " + trial + ": statusDetails must match status");
+        }
     }
 
     @Test

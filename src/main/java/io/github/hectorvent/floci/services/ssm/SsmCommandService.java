@@ -687,9 +687,16 @@ public class SsmCommandService implements Resettable {
         command.setErrorCount(errors);
 
         if (!anyInProgress && completed == instanceIds.size()) {
+            // Use the local status, not a re-read of command.getStatus(): commandStore is a plain
+            // ConcurrentHashMap-backed InMemoryStorage whose get() returns the same shared Command
+            // object on every call, not a defensive copy. Re-reading it here left a window between
+            // the two lines where a concurrent updateCommandStatus call for the same command (e.g.
+            // another instance's async completion racing this one) could mutate that shared object
+            // in between, so this call's own statusDetails ended up reflecting a DIFFERENT thread's
+            // status than the one it just wrote to status itself.
             String status = commandStatus(errors, timedOut, instanceIds.size());
             command.setStatus(status);
-            command.setStatusDetails(statusDetails(command.getStatus()));
+            command.setStatusDetails(statusDetails(status));
         }
 
         commandStore.put(commandKey(region, commandId), command);
