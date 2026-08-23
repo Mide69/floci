@@ -290,6 +290,79 @@ class SsmCommandServiceDirectExecutionTest {
     }
 
     @Test
+    void listCommandsBlocksWhileARollupHoldsTheCommandLock() throws Exception {
+        // Regression flagged in review on PR #2477: even with writers now synchronized against each
+        // other, SsmJsonHandler.commandToNode() (the ListCommands serializer) used to read Status and
+        // StatusDetails from the same live, shared Command object without taking that same lock. A
+        // ListCommands call whose two field reads straddled a concurrent writer's update could observe
+        // a torn pair - e.g. Status read before the writer's change, StatusDetails read after it
+        // completes - reporting a combination that was never actually true at any single instant. This
+        // is plausibly the actual path #2264 was originally observed through, since a customer polls
+        // status via ListCommands, not the internal rollup directly.
+        //
+        // Proven the same way as the writer-vs-writer case: commandStore.put() is called from inside
+        // the synchronized block that guards the write, so a spy can force the rollup to block while
+        // still holding the lock, and this asserts a concurrent ListCommands call (which now also
+        // synchronizes on the same object before reading) blocks too rather than observing a torn read.
+        SsmDirectCommandExecutor executor = mock(SsmDirectCommandExecutor.class);
+        Instant start = Instant.parse("2026-06-07T00:00:00Z");
+        Instant end = Instant.parse("2026-06-07T00:00:01Z");
+        when(executor.supports(eq("i-race"), eq("AWS-RunShellScript"))).thenReturn(true);
+        when(executor.executeIfSupported(eq("i-race"), eq("AWS-RunShellScript"), any(), eq(60)))
+                .thenReturn(Optional.of(new SsmDirectCommandExecutor.ExecutionResult(
+                        "Success", "done\n", "", 0, start, end)));
+
+        CountDownLatch rollupHoldingLock = new CountDownLatch(1);
+        CountDownLatch releaseRollup = new CountDownLatch(1);
+        AccountAwareStorageBackend<Command> realCommandStore = AccountAwareStorageBackend.inMemory("000000000000");
+        AccountAwareStorageBackend<Command> commandStore = spy(realCommandStore);
+        doAnswer(invocation -> {
+            Command value = invocation.getArgument(1);
+            if ("Success".equals(value.getStatus())) {
+                rollupHoldingLock.countDown();
+                assertTrue(releaseRollup.await(5, TimeUnit.SECONDS),
+                        "test did not release the rollup in time");
+            }
+            return invocation.callRealMethod();
+        }).when(commandStore).put(any(), any());
+
+        SsmCommandService commandService = new SsmCommandService(
+                new SingleCommandStoreFactory(commandStore), objectMapper, regionResolver, executor);
+        SsmJsonHandler jsonHandler = new SsmJsonHandler(mock(SsmService.class), commandService, objectMapper);
+
+        Command command = commandService.sendCommand(objectMapper.readTree("""
+                {
+                  "InstanceIds": ["i-race"],
+                  "DocumentName": "AWS-RunShellScript",
+                  "Parameters": {
+                    "commands": ["echo hi"]
+                  },
+                  "TimeoutSeconds": 60
+                }
+                """), "us-west-2");
+
+        assertTrue(rollupHoldingLock.await(5, TimeUnit.SECONDS), "rollup never reached its blocking put()");
+
+        ObjectNode listRequest = objectMapper.createObjectNode().put("CommandId", command.getCommandId());
+        AtomicBoolean listReturned = new AtomicBoolean(false);
+        Thread listThread = new Thread(() -> {
+            jsonHandler.handle("ListCommands", listRequest, "us-west-2");
+            listReturned.set(true);
+        });
+        listThread.start();
+
+        // Give ListCommands every chance to (wrongly) proceed if the read weren't guarded by the
+        // same lock.
+        Thread.sleep(200);
+        assertFalse(listReturned.get(),
+                "ListCommands must block while the rollup holds the command's lock, not observe a torn read");
+
+        releaseRollup.countDown();
+        listThread.join(5000);
+        assertTrue(listReturned.get(), "ListCommands should complete once the rollup releases the lock");
+    }
+
+    @Test
     void concurrentInstanceCompletions_neverLeaveStatusAndStatusDetailsInconsistent() throws Exception {
         // Regression for #2264: commandStore is a plain ConcurrentHashMap-backed InMemoryStorage
         // whose get() returns the SAME shared Command object on every call, not a defensive copy. A
