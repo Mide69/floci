@@ -284,9 +284,15 @@ class SsmCommandServiceDirectExecutionTest {
         cancelThread.join(5000);
         assertTrue(cancelReturned.get(), "cancelCommand should complete once the rollup releases the lock");
 
+        // The rollup's write to Success is what the blocked put() was holding up - that field
+        // mutation already happened before cancelCommand could even attempt to acquire the lock, so
+        // by the time it does, the command is already terminal. cancelCommand's own isTerminal guard
+        // (added for the "stale rollup overwrites cancellation" fix) correctly makes it a no-op here,
+        // matching real AWS's CancelCommand against an already-completed command: Success wins
+        // because it was actually first, not Cancelled just because this thread called second.
         Command finalCommand = service.listCommands(command.getCommandId(), null, "us-west-2").getFirst();
-        assertEquals("Cancelled", finalCommand.getStatus());
-        assertEquals("Cancelled", finalCommand.getStatusDetails());
+        assertEquals("Success", finalCommand.getStatus());
+        assertEquals("Success", finalCommand.getStatusDetails());
     }
 
     @Test
@@ -360,6 +366,70 @@ class SsmCommandServiceDirectExecutionTest {
         releaseRollup.countDown();
         listThread.join(5000);
         assertTrue(listReturned.get(), "ListCommands should complete once the rollup releases the lock");
+    }
+
+    @Test
+    void cancellationSticksAgainstAStaleCompletion() throws Exception {
+        // Regression: greptile flagged two related P1s on PR #2477. A completion whose result was
+        // already in flight when cancellation landed could still overwrite the invocation once it
+        // finally acquired the lock ("Completion resurrects cancelled invocation"), and the command
+        // rollup - computed from that resurrected, no-longer-Cancelled invocation - could then
+        // overwrite the command's own Cancelled status too ("Stale rollup overwrites cancellation").
+        // Both are closed by an isTerminal() check taken under each object's lock immediately before
+        // writing, so a write that started before cancellation can no longer clobber it once it
+        // finally lands.
+        //
+        // Direct execution is held open past when cancelCommand runs to completion, then released -
+        // this forces the exact ordering deterministically (cancellation happens synchronously on
+        // this thread, guaranteed to finish before the execution latch is ever released), rather
+        // than relying on timing to hit a narrow window.
+        SsmDirectCommandExecutor executor = mock(SsmDirectCommandExecutor.class);
+        Instant start = Instant.parse("2026-06-07T00:00:00Z");
+        Instant end = Instant.parse("2026-06-07T00:00:01Z");
+        CountDownLatch executionStarted = new CountDownLatch(1);
+        CountDownLatch releaseExecution = new CountDownLatch(1);
+        when(executor.supports(eq("i-race"), eq("AWS-RunShellScript"))).thenReturn(true);
+        when(executor.executeIfSupported(eq("i-race"), eq("AWS-RunShellScript"), any(), eq(60)))
+                .thenAnswer(invocation -> {
+                    executionStarted.countDown();
+                    assertTrue(releaseExecution.await(5, TimeUnit.SECONDS),
+                            "test did not release execution in time");
+                    return Optional.of(new SsmDirectCommandExecutor.ExecutionResult(
+                            "Success", "done\n", "", 0, start, end));
+                });
+
+        SsmCommandService service = new SsmCommandService(
+                new InMemoryStorageFactory(), objectMapper, regionResolver, executor);
+
+        Command command = service.sendCommand(objectMapper.readTree("""
+                {
+                  "InstanceIds": ["i-race"],
+                  "DocumentName": "AWS-RunShellScript",
+                  "Parameters": {
+                    "commands": ["echo hi"]
+                  },
+                  "TimeoutSeconds": 60
+                }
+                """), "us-west-2");
+
+        assertTrue(executionStarted.await(5, TimeUnit.SECONDS), "direct execution never started");
+
+        // Cancel while the (stale, about to succeed) execution is still in flight.
+        service.cancelCommand(command.getCommandId(), null, "us-west-2");
+        assertEquals("Cancelled", service.listCommands(command.getCommandId(), null, "us-west-2").getFirst().getStatus());
+        assertEquals("Cancelled",
+                service.getCommandInvocation(command.getCommandId(), "i-race", "us-west-2").getStatus());
+
+        // Let the stale completion finally land.
+        releaseExecution.countDown();
+        Thread.sleep(300);
+
+        Command finalCommand = service.listCommands(command.getCommandId(), null, "us-west-2").getFirst();
+        CommandInvocation finalInvocation = service.getCommandInvocation(command.getCommandId(), "i-race", "us-west-2");
+        assertEquals("Cancelled", finalCommand.getStatus(), "a stale completion must not resurrect a cancelled command");
+        assertEquals("Cancelled", finalCommand.getStatusDetails());
+        assertEquals("Cancelled", finalInvocation.getStatus(), "a stale completion must not resurrect a cancelled invocation");
+        assertEquals("Cancelled", finalInvocation.getStatusDetails());
     }
 
     @Test

@@ -284,11 +284,17 @@ public class SsmCommandService implements Resettable {
         }
 
         // Same lock updateCommandStatus takes on this exact object, so a rollup completing this
-        // command concurrently can't have its own status+statusDetails write interleave with this one.
+        // command concurrently can't have its own status+statusDetails write interleave with this
+        // one - and the isTerminal check keeps this symmetric with that same guard: a command that
+        // already finished (Success/Failed/TimedOut) while this cancellation was in flight stays
+        // finished, matching real AWS's CancelCommand being a no-op against an already-terminal
+        // command rather than retroactively marking it Cancelled.
         synchronized (command) {
-            command.setStatus("Cancelled");
-            command.setStatusDetails("Cancelled");
-            commandStore.put(commandKey(region, commandId), command);
+            if (!isTerminal(command.getStatus())) {
+                command.setStatus("Cancelled");
+                command.setStatusDetails("Cancelled");
+                commandStore.put(commandKey(region, commandId), command);
+            }
         }
         LOG.infov("CancelCommand: commandId={0}", commandId);
     }
@@ -314,6 +320,12 @@ public class SsmCommandService implements Resettable {
                 continue;
             }
             synchronized (invocation) {
+                // Re-check under the lock: the isActiveInvocation check above ran before acquiring
+                // it, so a concurrent cancelCommand (or any other writer) could have already moved
+                // this invocation to a terminal state in between.
+                if (!isActiveInvocation(invocation.getStatus())) {
+                    continue;
+                }
                 invocation.setStatus("Failed");
                 invocation.setStatusDetails(statusDetails);
                 invocation.setResponseCode(-1);
@@ -439,13 +451,20 @@ public class SsmCommandService implements Resettable {
             CommandInvocation inv = invocationStore.get(invKey).orElse(null);
             if (inv != null) {
                 synchronized (inv) {
-                    inv.setStatus(toInvocationStatus(status));
-                    inv.setStatusDetails(statusDetails(toInvocationStatus(status)));
-                    inv.setStandardOutputContent(stdout);
-                    inv.setStandardErrorContent(stderr);
-                    inv.setResponseCode(returnCode);
-                    inv.setExecutionEndDateTime(endTime);
-                    invocationStore.put(invKey, inv);
+                    // If a cancellation landed on this invocation while the agent's reply was still
+                    // in flight, don't let this stale result resurrect it out of Cancelled. Still
+                    // fall through to the rollup below either way - it re-derives command status
+                    // from current invocation state and is safe to call even when this write was
+                    // skipped.
+                    if (!isTerminal(inv.getStatus())) {
+                        inv.setStatus(toInvocationStatus(status));
+                        inv.setStatusDetails(statusDetails(toInvocationStatus(status)));
+                        inv.setStandardOutputContent(stdout);
+                        inv.setStandardErrorContent(stderr);
+                        inv.setResponseCode(returnCode);
+                        inv.setExecutionEndDateTime(endTime);
+                        invocationStore.put(invKey, inv);
+                    }
                 }
             }
 
@@ -469,10 +488,12 @@ public class SsmCommandService implements Resettable {
         String invKey = invocationKey(region, commandId, instanceId);
         invocationStore.get(invKey).ifPresent(inv -> {
             synchronized (inv) {
-                inv.setStatus("Failed");
-                inv.setStatusDetails("Failed: " + failureType);
-                inv.setExecutionEndDateTime(Instant.now());
-                invocationStore.put(invKey, inv);
+                if (!isTerminal(inv.getStatus())) {
+                    inv.setStatus("Failed");
+                    inv.setStatusDetails("Failed: " + failureType);
+                    inv.setExecutionEndDateTime(Instant.now());
+                    invocationStore.put(invKey, inv);
+                }
             }
         });
         updateCommandStatus(commandId, region);
@@ -543,7 +564,11 @@ public class SsmCommandService implements Resettable {
         CompletableFuture.runAsync(() -> {
             String invKey = invocationKey(region, commandId, instanceId);
             CommandInvocation invocation = invocationStore.get(invKey).orElse(null);
-            if (invocation == null || "Cancelled".equals(invocation.getStatus())) {
+            // This check is only a cheap early exit - direct execution can run for up to
+            // timeoutSeconds, so a cancellation landing after this point but before either write
+            // below is still possible. Each write re-checks under its own lock immediately before
+            // writing, which is the check that actually closes the race.
+            if (invocation == null || isTerminal(invocation.getStatus())) {
                 return;
             }
 
@@ -552,17 +577,24 @@ public class SsmCommandService implements Resettable {
                     .orElse(null);
             if (result == null) {
                 synchronized (invocation) {
-                    invocation.setStatus("Pending");
-                    invocation.setStatusDetails(statusDetails("Pending"));
-                    invocationStore.put(invKey, invocation);
+                    // Don't requeue an invocation a concurrent cancelCommand already terminated.
+                    if (!isTerminal(invocation.getStatus())) {
+                        invocation.setStatus("Pending");
+                        invocation.setStatusDetails(statusDetails("Pending"));
+                        invocationStore.put(invKey, invocation);
+                    }
                 }
                 queueMessage(commandId, instanceId, documentName, parameters, timeoutSeconds, region);
                 updateCommandStatus(commandId, region);
                 return;
             }
             synchronized (invocation) {
-                applyDirectResult(invocation, result);
-                invocationStore.put(invKey, invocation);
+                // Don't let a result that was already in flight when cancellation landed resurrect
+                // this invocation out of Cancelled (or any other terminal state).
+                if (!isTerminal(invocation.getStatus())) {
+                    applyDirectResult(invocation, result);
+                    invocationStore.put(invKey, invocation);
+                }
             }
             updateCommandStatus(commandId, region);
         }, directExecutionExecutor);
@@ -716,7 +748,12 @@ public class SsmCommandService implements Resettable {
             command.setCompletedCount(completed);
             command.setErrorCount(errors);
 
-            if (!anyInProgress && completed == instanceIds.size()) {
+            // isTerminal guards against a stale rollup: the invocation-status counts above were read
+            // before this lock was acquired, so a concurrent cancelCommand could have already stored
+            // Cancelled by the time this call gets the lock. Without this check, this call would
+            // overwrite that terminal state with whatever it computed from its now-outdated snapshot,
+            // silently losing the cancellation.
+            if (!anyInProgress && completed == instanceIds.size() && !isTerminal(command.getStatus())) {
                 // Use the local status, not a re-read of command.getStatus(): re-reading it here left
                 // a second, narrower window where a concurrent updateCommandStatus call for the same
                 // command (e.g. another instance's async completion racing this one) could mutate the
@@ -756,6 +793,21 @@ public class SsmCommandService implements Resettable {
 
     private static boolean isActiveInvocation(String status) {
         return "Pending".equals(status) || "InProgress".equals(status);
+    }
+
+    /**
+     * Whether a command or invocation status is terminal (Success, Failed, TimedOut, Cancelled).
+     * Once a status reaches one of these, no writer should transition it to anything else - most
+     * importantly, a completion that was already in flight when a cancellation landed must not
+     * resurrect the cancelled state by overwriting it with its own stale result. Every writer here
+     * that mutates a command's or invocation's status must check this immediately before writing,
+     * while still holding that object's lock, since the mutual-exclusion lock alone only guarantees
+     * writes don't interleave with each other - it says nothing about which write should win when
+     * two land at genuinely different times.
+     */
+    private static boolean isTerminal(String status) {
+        return "Success".equals(status) || "Failed".equals(status)
+                || "TimedOut".equals(status) || "Cancelled".equals(status);
     }
 
     private static String statusDetails(String status) {
