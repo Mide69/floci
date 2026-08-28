@@ -286,6 +286,85 @@ class CloudFormationIamAttachmentProvisionerTest {
     }
 
     @Test
+    void sameStackManagedPolicyRetryUpdatesDocumentInPlace() {
+        // github.com/floci-io/floci/issues/2237 - adopting an existing managed policy on update must
+        // still apply this template's current PolicyDocument as a new default version, or a changed
+        // document is silently dropped while the stack still reports UPDATE_COMPLETE. Same class of
+        // gap sameStackRoleUpdateAppliesChangedTrustPolicy covers for AWS::IAM::Role, one resource
+        // type over.
+        String policyArn = "arn:aws:iam::" + ACCOUNT_ID + ":policy/existing-policy";
+        IamPolicy policy = new IamPolicy(
+                "ANPAEXISTING", "existing-policy", "/", policyArn, null, "{}");
+        when(iamService.createPolicy("existing-policy", "/", null, policyDocument(), Map.of()))
+                .thenThrow(new AwsException("EntityAlreadyExists", "already exists", 409));
+        when(iamService.getPolicy(policyArn)).thenReturn(policy);
+
+        StackResource result = provision("ManagedPolicy", "AWS::IAM::ManagedPolicy", """
+                {
+                  "ManagedPolicyName": "existing-policy",
+                  "PolicyDocument": {"Version": "2012-10-17", "Statement": []}
+                }
+                """, policyArn, Map.of("PolicyId", policy.getPolicyId()));
+
+        assertEquals("CREATE_COMPLETE", result.getStatus());
+        verify(iamService).createPolicyVersion(policyArn, policyDocument(), true);
+        verify(iamService, never()).deletePolicy(anyString());
+        assertEquals(policyArn, result.getPhysicalId());
+        assertEquals(policy.getPolicyId(), result.getAttributes().get("PolicyId"));
+    }
+
+    @Test
+    void sameStackManagedPolicyRetryFailureDoesNotDeleteAdoptedPolicy() {
+        // Companion to sameStackManagedPolicyRetryUpdatesDocumentInPlace: an adopted policy pre-dates
+        // this attempt, so a later failure (e.g. a bad Roles entry) must never delete it. Only a
+        // policy this attempt actually created is this attempt's to clean up.
+        String policyArn = "arn:aws:iam::" + ACCOUNT_ID + ":policy/existing-policy";
+        IamPolicy policy = new IamPolicy(
+                "ANPAEXISTING", "existing-policy", "/", policyArn, null, "{}");
+        when(iamService.createPolicy("existing-policy", "/", null, policyDocument(), Map.of()))
+                .thenThrow(new AwsException("EntityAlreadyExists", "already exists", 409));
+        when(iamService.getPolicy(policyArn)).thenReturn(policy);
+        doThrow(new AwsException("NoSuchEntity", "missing role", 404))
+                .when(iamService).attachRolePolicy("missing-role", policyArn);
+
+        StackResource result = provision("ManagedPolicy", "AWS::IAM::ManagedPolicy", """
+                {
+                  "ManagedPolicyName": "existing-policy",
+                  "PolicyDocument": {"Version": "2012-10-17", "Statement": []},
+                  "Roles": ["missing-role"]
+                }
+                """, policyArn, Map.of("PolicyId", policy.getPolicyId()));
+
+        assertEquals("CREATE_FAILED", result.getStatus());
+        verify(iamService, never()).deletePolicy(anyString());
+    }
+
+    @Test
+    void managedPolicyRetryForADifferentPolicyIsNotAdopted() {
+        // If the tracked PolicyId does not match what EntityAlreadyExists actually collided with,
+        // this attempt does not own that policy (a different resource claimed the same name+path,
+        // or ManagedPolicyName changed to a name already used elsewhere). Must not silently version
+        // someone else's policy.
+        String policyArn = "arn:aws:iam::" + ACCOUNT_ID + ":policy/existing-policy";
+        IamPolicy otherPolicy = new IamPolicy(
+                "ANPAOTHER", "existing-policy", "/", policyArn, null, "{}");
+        when(iamService.createPolicy("existing-policy", "/", null, policyDocument(), Map.of()))
+                .thenThrow(new AwsException("EntityAlreadyExists", "already exists", 409));
+        when(iamService.getPolicy(policyArn)).thenReturn(otherPolicy);
+
+        StackResource result = provision("ManagedPolicy", "AWS::IAM::ManagedPolicy", """
+                {
+                  "ManagedPolicyName": "existing-policy",
+                  "PolicyDocument": {"Version": "2012-10-17", "Statement": []}
+                }
+                """, policyArn, Map.of("PolicyId", "ANPANOTMINE"));
+
+        assertEquals("CREATE_FAILED", result.getStatus());
+        assertEquals("already exists", result.getStatusReason());
+        verify(iamService, never()).createPolicyVersion(anyString(), anyString(), eq(true));
+    }
+
+    @Test
     void cleanupFailureDoesNotMaskPrimaryFailureOrSkipDeletion() {
         IamRole role = role("cleanup-role");
         when(iamService.createRole("cleanup-role", "/", emptyTrustPolicy(), null, 3600, Map.of()))

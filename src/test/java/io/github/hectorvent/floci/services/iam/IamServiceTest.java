@@ -322,6 +322,32 @@ class IamServiceTest {
     }
 
     @Test
+    void createPolicyVersionAfterOutOfOrderDeletionDoesNotReuseId() {
+        // github.com/floci-io/floci/issues/2237 (Related) - deriving the next version id from
+        // versions.size() + 1 reissues an id still held by a surviving version once an earlier one
+        // is deleted out of order: v1/v2/v3 with v1 deleted leaves size() == 2, so size() + 1 == 3
+        // collides with the existing v3 and silently overwrites its document.
+        String doc1 = "{\"v\":1}";
+        String doc2 = "{\"v\":2}";
+        String doc3 = "{\"v\":3}";
+        String doc4 = "{\"v\":4}";
+        IamPolicy policy = iamService.createPolicy("P", "/", null, doc1, null);
+        String arn = policy.getArn();
+
+        iamService.createPolicyVersion(arn, doc2, false);
+        iamService.createPolicyVersion(arn, doc3, false);
+        iamService.setDefaultPolicyVersion(arn, "v3");
+        iamService.deletePolicyVersion(arn, "v1");
+
+        PolicyVersion v4 = iamService.createPolicyVersion(arn, doc4, false);
+
+        assertEquals("v4", v4.getVersionId());
+        IamPolicy afterCreate = iamService.getPolicy(arn);
+        assertEquals(doc3, afterCreate.getVersions().get("v3").getDocument(),
+                "the surviving v3 must not be overwritten by the newly created version");
+    }
+
+    @Test
     void deletePolicyVersionDefaultFails() {
         IamPolicy policy = iamService.createPolicy("P", "/", null, "{}", null);
         assertThrows(AwsException.class,

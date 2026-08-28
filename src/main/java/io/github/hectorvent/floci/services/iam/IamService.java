@@ -871,18 +871,28 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Map<String, PolicyVersion> versions = policy.getVersions();
         PolicyVersion version;
         synchronized (versions) {
-            int nextVersionNum = versions.size() + 1;
-            if (nextVersionNum > 5) {
+            if (versions.size() >= 5) {
                 throw new AwsException("LimitExceeded",
                         "A managed policy can have up to 5 versions.", 409);
             }
-            String versionId = "v" + nextVersionNum;
+            // Derive the id from the policy's own monotonic counter, not versions.size() + 1: size()
+            // drops when a version is deleted, so a policy with v1/v2/v4/v5 (v3 deleted) would
+            // otherwise compute "v5" again from size()+1=5 and silently overwrite the surviving v5.
+            // The containsKey advance is a self-heal for policies persisted before this counter
+            // existed, whose deserialized default undercounts - it costs nothing for the normal case,
+            // since the counter is already correct there and the loop body never runs.
+            int versionNum = policy.getNextVersionNumber();
+            while (versions.containsKey("v" + versionNum)) {
+                versionNum++;
+            }
+            String versionId = "v" + versionNum;
             version = new PolicyVersion(versionId, document, setAsDefault);
             if (setAsDefault) {
                 versions.values().forEach(v -> v.setDefaultVersion(false));
                 policy.setDefaultVersionId(versionId);
             }
             versions.put(versionId, version);
+            policy.setNextVersionNumber(versionNum + 1);
         }
         policy.setUpdateDate(Instant.now());
         policies.put(policyArn, policy);

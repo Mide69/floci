@@ -76,6 +76,7 @@ import io.github.hectorvent.floci.services.elbv2.model.Rule;
 import io.github.hectorvent.floci.services.elbv2.model.RuleCondition;
 import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
@@ -3049,12 +3050,37 @@ public class CloudFormationResourceProvisioner {
                 : "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
         List<String> roleNames = resolveStringList(props, "Roles", engine);
 
-        var policy = iamService.createPolicy(policyName, "/", null, document, Map.of());
-        r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+        String existingArn = r.getPhysicalId();
+        IamPolicy policy;
+        boolean createdPolicy = false;
+        try {
+            policy = iamService.createPolicy(policyName, "/", null, document, Map.of());
+            createdPolicy = true;
+            r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
+        } catch (AwsException e) {
+            if (!"EntityAlreadyExists".equals(e.getErrorCode()) || existingArn == null) {
+                throw e;
+            }
+            // Same-stack update/retry: apply this template's current PolicyDocument as a new
+            // default version on the policy this resource already owns, or a changed document is
+            // silently dropped while the stack still reports UPDATE_COMPLETE - the same class of
+            // gap #1965/#2152 fixed for LogGroup and #2084/#2143 fixed for IAM role trust
+            // policies, one resource type over.
+            policy = iamService.getPolicy(existingArn);
+            String existingPolicyId = r.getAttributes().get("PolicyId");
+            if (existingPolicyId == null || existingPolicyId.isBlank()
+                    || !existingPolicyId.equals(policy.getPolicyId())) {
+                // Not this stack's policy: a different resource collided on name+path, or
+                // ManagedPolicyName changed to a name already used elsewhere. Not ours to adopt.
+                throw e;
+            }
+            iamService.createPolicyVersion(existingArn, document, true);
+        }
         r.setPhysicalId(policy.getArn());
+        r.getAttributes().put("PolicyId", policy.getPolicyId());
         // PolicyArn is the attribute CloudFormation documents for this type, and what a template
         // written against AWS asks for. Without it Fn::GetAtt does not resolve and the unresolved
-        // literal reaches whatever consumed it — a role's ManagedPolicyArns, typically, which then
+        // literal reaches whatever consumed it, a role's ManagedPolicyArns typically, which then
         // fails with "policy does not exist" and rolls the stack back. "Arn" stays for callers
         // already using it.
         r.getAttributes().put("Arn", policy.getArn());
@@ -3062,9 +3088,10 @@ public class CloudFormationResourceProvisioner {
         r.getAttributes().put("ManagedPolicyRoleTargets", String.join("\n", roleNames));
 
         LinkedHashSet<String> attachedRoleNames = new LinkedHashSet<>();
+        String policyArn = policy.getArn();
         try {
             for (String roleName : roleNames) {
-                iamService.attachRolePolicy(roleName, policy.getArn());
+                iamService.attachRolePolicy(roleName, policyArn);
                 attachedRoleNames.add(roleName);
             }
         } catch (RuntimeException failure) {
@@ -3072,18 +3099,23 @@ public class CloudFormationResourceProvisioner {
             Collections.reverse(rollbackRoles);
             boolean cleanupSucceeded = true;
             for (String roleName : rollbackRoles) {
-                String cleanupDescription = "detach policy " + policy.getArn() + " from role " + roleName;
+                String cleanupDescription = "detach policy " + policyArn + " from role " + roleName;
                 if (!CfnRollback.attemptIamCleanup(failure, cleanupDescription,
-                        () -> iamService.detachRolePolicy(roleName, policy.getArn()))) {
+                        () -> iamService.detachRolePolicy(roleName, policyArn))) {
                     cleanupSucceeded = false;
                 }
             }
-            if (!CfnRollback.attemptIamCleanup(failure, "delete policy " + policy.getArn(),
-                    () -> iamService.deletePolicy(policy.getArn()))) {
-                cleanupSucceeded = false;
-            }
-            if (cleanupSucceeded) {
-                r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
+            // Only a policy this attempt created is ours to delete on failure - one this attempt
+            // merely adopted (updated with a new version) pre-existed this attempt and rolling back
+            // means leaving it alone, not destroying it.
+            if (createdPolicy) {
+                if (!CfnRollback.attemptIamCleanup(failure, "delete policy " + policyArn,
+                        () -> iamService.deletePolicy(policyArn))) {
+                    cleanupSucceeded = false;
+                }
+                if (cleanupSucceeded) {
+                    r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
+                }
             }
             throw failure;
         }

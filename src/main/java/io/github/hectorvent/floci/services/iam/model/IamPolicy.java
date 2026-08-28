@@ -19,6 +19,13 @@ public class IamPolicy {
     private String arn;
     private String description;
     private String defaultVersionId = "v1";
+    // Monotonic counter for the next version number to assign, independent of how many versions
+    // currently exist. versions.size() drops when a version is deleted, so deriving the next id
+    // from it can reissue an id still in use by a surviving version once one gets pruned out of
+    // order (e.g. v3 deleted while v1/v2/v4/v5 remain: versions.size() becomes 4, size()+1 = 5,
+    // "v5" already exists and would be silently overwritten). AWS version ids are monotonic and
+    // never reused, so this only ever increments.
+    private int nextVersionNumber = 2;
     private int attachmentCount = 0;
     private Instant createDate;
     private Instant updateDate;
@@ -63,6 +70,9 @@ public class IamPolicy {
 
     public String getDefaultVersionId() { return defaultVersionId; }
     public void setDefaultVersionId(String defaultVersionId) { this.defaultVersionId = defaultVersionId; }
+
+    public int getNextVersionNumber() { return nextVersionNumber; }
+    public void setNextVersionNumber(int nextVersionNumber) { this.nextVersionNumber = nextVersionNumber; }
 
     public int getAttachmentCount() { return attachmentCount; }
     public void setAttachmentCount(int attachmentCount) { this.attachmentCount = attachmentCount; }
