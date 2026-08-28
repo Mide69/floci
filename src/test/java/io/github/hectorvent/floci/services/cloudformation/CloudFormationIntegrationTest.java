@@ -2317,6 +2317,42 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_schedulerScheduleGroup_isActuallyProvisioned() {
+        // github.com/floci-io/floci/issues/2396: AWS::Scheduler::ScheduleGroup fell through to the
+        // generic stub, so the stack reported CREATE_COMPLETE with a fake physical id and the group
+        // never actually existed. GetScheduleGroup used to return ResourceNotFoundException here.
+        String template = """
+            {
+              "Resources": {
+                "MyGroup": {
+                  "Type": "AWS::Scheduler::ScheduleGroup",
+                  "Properties": {
+                    "Name": "group-repro"
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "SchedulerGroupStack")
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/schedule-groups/group-repro")
+        .then()
+            .statusCode(200)
+            .body(containsString("group-repro"));
+    }
+
+    @Test
     void createStack_multipleUnnamedResources_uniqueNames() {
         // Multiple resources of same type without names get unique auto-generated names
         String template = """
