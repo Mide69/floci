@@ -81,6 +81,7 @@ cross-resource references.
 | Batch | `ComputeEnvironment`, `JobQueue`, `JobDefinition` |
 | Cognito | `UserPool`, `UserPoolClient` |
 | EventBridge | `Rule`, `EventBus`, `EventBusPolicy` |
+| EventBridge Scheduler | `ScheduleGroup` |
 | Pipes | `Pipe` |
 | Kinesis | `Stream` |
 | Kinesis Data Firehose | `DeliveryStream` |
