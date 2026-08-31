@@ -105,6 +105,7 @@ AWS::SNS::Topic	SnsCfnProvisioner
 AWS::SQS::Queue	SqsCfnProvisioner
 AWS::SQS::QueuePolicy	SqsCfnProvisioner
 AWS::SSM::Parameter	SsmCfnProvisioner
+AWS::Scheduler::ScheduleGroup	SchedulerScheduleGroupCfnProvisioner
 AWS::SecretsManager::Secret	LEGACY_SWITCH
 AWS::SecretsManager::SecretTargetAttachment	LEGACY_SWITCH
 AWS::StepFunctions::StateMachine	LEGACY_SWITCH
