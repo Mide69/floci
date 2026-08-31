@@ -83,6 +83,8 @@ floci:
                    # Needed for multi-container Docker setups. Example: FLOCI_HOSTNAME=floci
   default-region: us-east-1
   default-account-id: "000000000000"
+  # Shared mock-response config for Textract/Comprehend/Rekognition. See AiMockConfigLoader.
+  ai-mock-config-file: ${AI_MOCK_CONFIG:}
   storage:
     # Supported modes: memory, persistent, hybrid, wal
     mode: memory
@@ -238,6 +240,7 @@ floci:
       enabled: true
       enforce-auth: false
       default-presign-expiry-seconds: 3600
+      global-bucket-namespace: false
     dynamodb:
       enabled: true
     sns:
@@ -247,8 +250,13 @@ floci:
       ephemeral: false
       default-memory-mb: 128
       default-timeout-seconds: 3
-      runtime-api-base-port: 9200
-      runtime-api-max-port: 9299
+      # 500 ports, not the former 100 (9200-9299): one port is held per running Lambda
+      # container, so this is the concurrent-execution ceiling, and a multi-account LZA needs
+      # ~112 at once. See EmulatorConfig.runtimeApiBasePort for why 12000 and not a wider 9200.
+      # Keep in step with the @WithDefault there — a value set here WINS over the annotation,
+      # so changing only the default silently does nothing (the issue #2225 trap).
+      runtime-api-base-port: 12000
+      runtime-api-max-port: 12499
       code-path: ./data/lambda-code
       poll-interval-ms: 1000
       container-idle-timeout-seconds: 300
@@ -306,6 +314,13 @@ floci:
       proxy-base-port: 6400
       proxy-max-port: 6419
       default-image: "valkey/valkey:8"
+    redshift:
+      enabled: true
+      default-port: 5439
+      image-version: postgres:15-alpine
+      proxy-base-port: 7100
+      proxy-max-port: 7199
+      # endpoint-host: localhost                 # Hostname clients use; empty -> DockerHostResolver
     rds:
       enabled: true
       mock: false                                 # FLOCI_SERVICES_RDS_MOCK — true = metadata only, no Docker (useful for CI)
@@ -365,6 +380,9 @@ floci:
       timeout-sweep-interval-seconds: 1
     cloudformation:
       enabled: true
+      # Fail an AWS::Lambda::Function whose S3 code cannot be read, as real CloudFormation
+      # does. Set true to fall back to the built-in stub handler instead (issue #2648).
+      allow-stub-lambda-code: false
     acm:
       enabled: true
       validation-wait-seconds: 0
@@ -405,6 +423,10 @@ floci:
       socat-image: alpine/socat
       mock: false
       aws-faithful-private-ip: false
+      # container-ips-routable: true  # Auto-detected by default (a throwaway TCP probe toward
+                                       # the container network). Set explicitly when the probe
+                                       # can't speak for your clients, e.g. Floci itself running
+                                       # containerized. FLOCI_SERVICES_EC2_CONTAINER_IPS_ROUTABLE
     ecs:
       enabled: true
       mock: false
@@ -428,6 +450,9 @@ floci:
       container-name: floci-ui
       port: 4500
       keep-running-on-shutdown: false
+      # endpoint: unset by default — Floci derives the sidecar's callback address automatically.
+      # Set an absolute http:// or https:// URL here only to override that derivation.
+      insecure-skip-tls-verify: false
     bedrock-runtime:
       enabled: true
       backend: stub
@@ -493,6 +518,10 @@ floci:
       enabled: true
     textract:
       enabled: true
+    comprehend:
+      enabled: true
+    rekognition:
+      enabled: true
     pricing:
       enabled: true
     transcribe:
@@ -541,6 +570,7 @@ floci:
       enabled: true
     organizations:
       enabled: true
+      # management-account-email: ""  # When set, overrides the management-account email reported by DescribeOrganization and account listings.
     rum:
       enabled: true
     networkfirewall:
@@ -556,6 +586,8 @@ floci:
     controltower:
       enabled: true
     route53resolver:
+      enabled: true
+    connect:
       enabled: true
     aps:
       enabled: true
@@ -580,4 +612,6 @@ floci:
     servicequotas:
       enabled: true
     ram:
+      enabled: true
+    codegurureviewer:
       enabled: true

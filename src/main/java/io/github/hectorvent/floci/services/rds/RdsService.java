@@ -26,6 +26,9 @@ import io.github.hectorvent.floci.services.rds.model.DbCluster;
 import io.github.hectorvent.floci.services.rds.model.DbClusterParameterGroup;
 import io.github.hectorvent.floci.services.rds.model.DbEndpoint;
 import io.github.hectorvent.floci.services.rds.model.DbInstance;
+import io.github.hectorvent.floci.services.kms.KmsService;
+import io.github.hectorvent.floci.services.kms.model.KmsKey;
+import io.github.hectorvent.floci.services.rds.model.DbInstanceSettings;
 import io.github.hectorvent.floci.services.rds.model.DbInstanceStatus;
 import io.github.hectorvent.floci.services.rds.model.DbParameterGroup;
 import io.github.hectorvent.floci.services.rds.model.DbProxy;
@@ -90,7 +93,13 @@ public class RdsService implements Resettable, ResourceProvider {
             managedDefault("postgres15"),
             managedDefault("postgres16"),
             managedDefault("postgres17"),
-            managedDefault("postgres18"));
+            managedDefault("postgres18"),
+            // DocumentDB clusters name these as their default (the families the DocDB engine
+            // versions map to); DocDbService validates a cluster's parameter group here
+            managedDefault("docdb3.6"),
+            managedDefault("docdb4.0"),
+            managedDefault("docdb5.0"),
+            managedDefault("docdb8.0"));
 
     /**
      * Engines AWS accepts for {@code EngineName} on an option group. Floci can only run
@@ -141,6 +150,7 @@ public class RdsService implements Resettable, ResourceProvider {
     private final RegionResolver regionResolver;
     private final EmulatorConfig config;
     private final SecretsManagerService secretsManagerService;
+    private final KmsService kmsService;
     private final DockerHostResolver dockerHostResolver;
     private final CurrentContainerNetworkResolver currentContainerNetworkResolver;
     private final ResourceGroupsTaggingService taggingService;
@@ -176,13 +186,15 @@ public class RdsService implements Resettable, ResourceProvider {
                       SecretsManagerService secretsManagerService,
                       DockerHostResolver dockerHostResolver,
                       CurrentContainerNetworkResolver currentContainerNetworkResolver,
-                      ResourceGroupsTaggingService taggingService) {
+                      ResourceGroupsTaggingService taggingService,
+                      KmsService kmsService) {
         this.containerManager = containerManager;
         this.proxyManager = proxyManager;
         this.ec2Service = ec2Service;
         this.regionResolver = regionResolver;
         this.config = config;
         this.secretsManagerService = secretsManagerService;
+        this.kmsService = kmsService;
         this.dockerHostResolver = dockerHostResolver;
         this.currentContainerNetworkResolver = currentContainerNetworkResolver;
         this.taggingService = taggingService;
@@ -294,7 +306,7 @@ public class RdsService implements Resettable, ResourceProvider {
         this(containerManager, proxyManager, ec2Service, regionResolver, config,
                 instances, clusters, parameterGroups, clusterParameterGroups, subnetGroups,
                 secretsManagerService, dockerHostResolver, currentContainerNetworkResolver,
-                proxies, proxyTargetGroups, new InMemoryStorage<>(), null);
+                proxies, proxyTargetGroups, new InMemoryStorage<>(), null, null);
     }
 
     RdsService(RdsContainerManager containerManager,
@@ -313,13 +325,15 @@ public class RdsService implements Resettable, ResourceProvider {
                StorageBackend<String, DbProxy> proxies,
                StorageBackend<String, DbProxyTargetGroup> proxyTargetGroups,
                StorageBackend<String, OptionGroup> optionGroups,
-               ResourceGroupsTaggingService taggingService) {
+               ResourceGroupsTaggingService taggingService,
+               KmsService kmsService) {
         this.containerManager = containerManager;
         this.proxyManager = proxyManager;
         this.ec2Service = ec2Service;
         this.regionResolver = regionResolver;
         this.config = config;
         this.secretsManagerService = secretsManagerService;
+        this.kmsService = kmsService;
         this.dockerHostResolver = dockerHostResolver;
         this.currentContainerNetworkResolver = currentContainerNetworkResolver;
         this.instances = instances;
@@ -478,6 +492,28 @@ public class RdsService implements Resettable, ResourceProvider {
                                        String optionGroupName,
                                        String region,
                                        boolean autoMinorVersionUpgrade) {
+        return createDbInstance(id, engineParam, engineVersion, masterUsername, masterPassword,
+                dbName, dbInstanceClass, allocatedStorage, iamEnabled, paramGroupName,
+                dbSubnetGroupName, dbClusterIdentifier, availabilityZone, multiAz,
+                manageMasterUserPassword, masterUserSecretKmsKeyId, tags, vpcSecurityGroupIds,
+                optionGroupName, region, autoMinorVersionUpgrade, DbInstanceSettings.defaults());
+    }
+
+    public DbInstance createDbInstance(String id, String engineParam, String engineVersion,
+                                       String masterUsername, String masterPassword,
+                                       String dbName, String dbInstanceClass,
+                                       int allocatedStorage, boolean iamEnabled,
+                                       String paramGroupName, String dbSubnetGroupName,
+                                       String dbClusterIdentifier, String availabilityZone,
+                                       boolean multiAz, boolean manageMasterUserPassword,
+                                       String masterUserSecretKmsKeyId,
+                                       Map<String, String> tags,
+                                       List<String> vpcSecurityGroupIds,
+                                       String optionGroupName,
+                                       String region,
+                                       boolean autoMinorVersionUpgrade,
+                                       DbInstanceSettings settings) {
+        validateInstanceSettings(settings);
         String provisioningKey = "instance:" + currentAccountId() + ":"
                 + dbResourceKey(effectiveRegion(region), id);
         if (!provisioningIds.add(provisioningKey)) {
@@ -489,7 +525,8 @@ public class RdsService implements Resettable, ResourceProvider {
                     masterPassword, dbName, dbInstanceClass, allocatedStorage, iamEnabled,
                     paramGroupName, dbSubnetGroupName, dbClusterIdentifier, availabilityZone,
                     multiAz, manageMasterUserPassword, masterUserSecretKmsKeyId, tags,
-                    vpcSecurityGroupIds, optionGroupName, region, autoMinorVersionUpgrade);
+                    vpcSecurityGroupIds, optionGroupName, region, autoMinorVersionUpgrade,
+                    settings);
         } finally {
             provisioningIds.remove(provisioningKey);
         }
@@ -507,7 +544,8 @@ public class RdsService implements Resettable, ResourceProvider {
                                           List<String> vpcSecurityGroupIds,
                                           String optionGroupName,
                                           String region,
-                                          boolean autoMinorVersionUpgrade) {
+                                          boolean autoMinorVersionUpgrade,
+                                          DbInstanceSettings settings) {
         String effectiveRegion = effectiveRegion(region);
         String dbiResourceId = "db-" + java.util.UUID.randomUUID().toString()
                 .replace("-", "").substring(0, 24).toUpperCase();
@@ -525,6 +563,9 @@ public class RdsService implements Resettable, ResourceProvider {
         validateInstanceParameterGroup(
                 paramGroupName, engineParam, engineVersion, effectiveRegion);
         validateInstanceOptionGroup(optionGroupName, engineParam, engineVersion, effectiveRegion);
+        // resolved with the other validations, before a port is taken or a container started
+        DbInstanceSettings resolvedSettings = withEffectiveWindows(settings, null)
+                .withKmsKeyId(resolveKmsKeyArn(settings.kmsKeyId(), effectiveRegion));
         boolean mock = config.services().rds().mock();
         // Always reserve a unique port (even in mock) so endpoints stay distinct and usedPorts
         // is consistent; mock mode only skips starting the container and auth proxy.
@@ -615,6 +656,7 @@ public class RdsService implements Resettable, ResourceProvider {
         instance.setSubnetAvailabilityZones(placement.subnetAvailabilityZones());
         instance.setAutoMinorVersionUpgrade(autoMinorVersionUpgrade);
         instance.setEngineIdentifier(engineIdentifier);
+        resolvedSettings.applyTo(instance);
 
         instance.setDbiResourceId(dbiResourceId);
         instance.setDbInstanceArn(dbInstanceArn);
@@ -1013,8 +1055,22 @@ public class RdsService implements Resettable, ResourceProvider {
             String id, String newPassword, Boolean iamEnabled,
             String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
             String optionGroupName, String region, Boolean autoMinorVersionUpgrade) {
+        return modifyDbInstance(id, newPassword, iamEnabled, dbSubnetGroupName,
+                vpcSecurityGroupIds, optionGroupName, region, autoMinorVersionUpgrade,
+                DbInstanceSettings.unchanged());
+    }
+
+    // synchronized like the tag and delete paths: an unguarded read-modify-write here could
+    // write an instance back after deleteDbInstance removed it
+    public synchronized DbInstance modifyDbInstance(
+            String id, String newPassword, Boolean iamEnabled,
+            String dbSubnetGroupName, List<String> vpcSecurityGroupIds,
+            String optionGroupName, String region, Boolean autoMinorVersionUpgrade,
+            DbInstanceSettings settings) {
+        validateInstanceSettings(settings);
         String effectiveRegion = effectiveRegion(region);
         DbInstance instance = getDbInstance(id, effectiveRegion);
+        DbInstanceSettings effective = withEffectiveWindows(settings, instance);
         instance.setStatus(DbInstanceStatus.AVAILABLE);
         if (optionGroupName != null && !optionGroupName.isBlank()) {
             validateInstanceOptionGroup(optionGroupName,
@@ -1022,7 +1078,21 @@ public class RdsService implements Resettable, ResourceProvider {
                     instance.getEngineVersion(), effectiveRegion);
             instance.setOptionGroupName(optionGroupName);
         }
+        boolean passwordRotated = false;
         if (newPassword != null && !newPassword.isBlank()) {
+            String oldPassword = instance.getMasterPassword();
+            boolean backendRunning = !config.services().rds().mock()
+                    && instance.getDbClusterIdentifier() == null && instance.getContainerId() != null;
+            passwordRotated = backendRunning && !newPassword.equals(oldPassword);
+            // Propagate the rotation into the running backend DB before overwriting the stored
+            // password — this is the last moment the old credential (which the backend still
+            // holds) is known. Without it every later connection fails: the proxy dials the
+            // backend with the rotated password against a database still holding the original.
+            if (passwordRotated) {
+                containerManager.rotateMasterPassword(
+                        instance.getDockerVolumeName(), instance.getContainerId(),
+                        instance.getEngine(), instance.getMasterUsername(), oldPassword, newPassword);
+            }
             instance.setMasterPassword(newPassword);
         }
         if (iamEnabled != null) {
@@ -1038,9 +1108,103 @@ public class RdsService implements Resettable, ResourceProvider {
         if (autoMinorVersionUpgrade != null) {
             instance.setAutoMinorVersionUpgrade(autoMinorVersionUpgrade);
         }
+        effective.applyTo(instance);
         putInstanceForScope(currentAccountId(), effectiveRegion, id, instance);
+
+        // The running auth proxy holds a password snapshot from start time, so swap it in place
+        // (a stop/start here races the listener rebind while relay connections are still open,
+        // and would drop live connections rotation shouldn't touch).
+        if (passwordRotated) {
+            proxyManager.updateMasterPassword(
+                    rdsResourceRelayKey(instance.getDbInstanceArn(), id), instance.getMasterPassword());
+        }
+
         LOG.infov("DB instance {0} modified", id);
         return instance;
+    }
+
+    private static void validateInstanceSettings(DbInstanceSettings settings) {
+        settings.validate();
+    }
+
+    /**
+     * The windows that will be in effect after the request, checked against each other the way a
+     * live account checks them. On create ({@code current} null) a window given alone is paired
+     * with the default, or with a window starting where the given one ends when the default would
+     * overlap it — AWS picks a random window clear of the given one. On modify the counterpart is
+     * the instance's.
+     */
+    private static DbInstanceSettings withEffectiveWindows(DbInstanceSettings settings, DbInstance current) {
+        String backup = settings.preferredBackupWindow();
+        String maintenance = settings.preferredMaintenanceWindow();
+        boolean backupGiven = backup != null;
+        boolean maintenanceGiven = maintenance != null;
+        if (current == null) {
+            if (!backupGiven) {
+                backup = maintenanceGiven && DbInstanceSettings.windowsOverlap(
+                        DbInstanceSettings.DEFAULT_BACKUP_WINDOW, maintenance)
+                        ? DbInstanceSettings.backupWindowAfter(maintenance)
+                        : DbInstanceSettings.DEFAULT_BACKUP_WINDOW;
+            }
+            if (!maintenanceGiven) {
+                maintenance = backupGiven && DbInstanceSettings.windowsOverlap(
+                        backup, DbInstanceSettings.DEFAULT_MAINTENANCE_WINDOW)
+                        ? DbInstanceSettings.maintenanceWindowAfter(backup)
+                        : DbInstanceSettings.DEFAULT_MAINTENANCE_WINDOW;
+            }
+            // a derived window is clear unless the given one leaves no 30-minute gap at all
+            if (DbInstanceSettings.windowsOverlap(backup, maintenance)) {
+                if (!maintenanceGiven) {
+                    throw DbInstanceSettings.noRoomForMaintenanceWindow();
+                }
+                if (!backupGiven) {
+                    throw DbInstanceSettings.noRoomForBackupWindow();
+                }
+            }
+        } else {
+            if (!backupGiven) {
+                backup = current.getPreferredBackupWindow() != null
+                        ? current.getPreferredBackupWindow() : DbInstanceSettings.DEFAULT_BACKUP_WINDOW;
+            }
+            if (!maintenanceGiven) {
+                maintenance = current.getPreferredMaintenanceWindow() != null
+                        ? current.getPreferredMaintenanceWindow() : DbInstanceSettings.DEFAULT_MAINTENANCE_WINDOW;
+            }
+        }
+        if (DbInstanceSettings.windowsOverlap(backup, maintenance)) {
+            throw DbInstanceSettings.overlappingWindows();
+        }
+        return new DbInstanceSettings(settings.storageEncrypted(), settings.kmsKeyId(),
+                settings.backupRetentionPeriod(), backup, maintenance, settings.copyTagsToSnapshot());
+    }
+
+    /**
+     * A live account takes the key as an ARN, a key id, an alias ARN or an alias name and reports
+     * the key ARN on the instance; a key it cannot use is one fault whatever the reason.
+     */
+    private String resolveKmsKeyArn(String kmsKeyId, String region) {
+        if (kmsKeyId == null || kmsKeyId.isBlank()) {
+            return null;
+        }
+        if (kmsService == null) {
+            throw new IllegalStateException("RdsService was built without a KmsService; "
+                    + "a KmsKeyId cannot be resolved");
+        }
+        KmsKey key;
+        try {
+            key = kmsService.describeKey(kmsKeyId, region);
+        } catch (AwsException e) {
+            throw kmsKeyNotAccessible(kmsKeyId);
+        }
+        if (!key.isEnabled() || "PendingDeletion".equals(key.getKeyState())) {
+            throw kmsKeyNotAccessible(kmsKeyId);
+        }
+        return key.getArn();
+    }
+
+    private static AwsException kmsKeyNotAccessible(String kmsKeyId) {
+        return new AwsException("KMSKeyNotAccessibleFault", "The specified KMS key [" + kmsKeyId
+                + "] does not exist, is not enabled or you do not have permissions to access it.", 400);
     }
 
     public List<Map<String, String>> describeOrderableDbInstanceOptions(String engine,
@@ -1485,7 +1649,7 @@ public class RdsService implements Resettable, ResourceProvider {
         return modifyDbCluster(id, newPassword, iamEnabled, null, null, null, region);
     }
 
-    public DbCluster modifyDbCluster(String id, String newPassword, Boolean iamEnabled,
+    public synchronized DbCluster modifyDbCluster(String id, String newPassword, Boolean iamEnabled,
                                      Double serverlessV2MinCapacity, Double serverlessV2MaxCapacity,
                                      Integer serverlessV2SecondsUntilAutoPause, String region) {
         String effectiveRegion = effectiveRegion(region);
@@ -1514,7 +1678,20 @@ public class RdsService implements Resettable, ResourceProvider {
             effectiveAutoPauseSeconds = validateServerlessV2ScalingConfiguration(
                     effectiveMinCapacity, effectiveMaxCapacity, requestedOrExistingAutoPause);
         }
+        boolean passwordRotated = false;
         if (newPassword != null && !newPassword.isBlank()) {
+            String oldPassword = cluster.getMasterPassword();
+            boolean backendRunning = !config.services().rds().mock()
+                    && cluster.getContainerId() != null;
+            passwordRotated = backendRunning && !newPassword.equals(oldPassword);
+            // Propagate the rotation into the running backend DB before overwriting the stored
+            // password — the last moment the old credential (which the backend still holds) is
+            // known — mirroring the ModifyDBInstance path.
+            if (passwordRotated) {
+                containerManager.rotateMasterPassword(
+                        cluster.getDockerVolumeName(), cluster.getContainerId(),
+                        cluster.getEngine(), cluster.getMasterUsername(), oldPassword, newPassword);
+            }
             cluster.setMasterPassword(newPassword);
         }
         if (iamEnabled != null) {
@@ -1526,6 +1703,27 @@ public class RdsService implements Resettable, ResourceProvider {
             cluster.setServerlessV2SecondsUntilAutoPause(effectiveAutoPauseSeconds);
         }
         putClusterForScope(currentAccountId(), effectiveRegion, id, cluster);
+
+        // A cluster rotation applies to every endpoint: the cluster's own proxy and each member
+        // instance's proxy hold start-time password snapshots, and member endpoints validate
+        // against the member's stored password, so propagate the rotated credential to all of
+        // them (AWS applies the cluster master password to every member endpoint).
+        if (passwordRotated) {
+            proxyManager.updateMasterPassword(
+                    rdsResourceRelayKey(cluster.getDbClusterArn(), id), newPassword);
+            for (String memberId : cluster.getDbClusterMembers()) {
+                DbInstance member = findInstanceForScope(
+                        currentAccountId(), effectiveRegion, memberId);
+                if (member == null) {
+                    continue;
+                }
+                member.setMasterPassword(newPassword);
+                putInstanceForScope(currentAccountId(), effectiveRegion, memberId, member);
+                proxyManager.updateMasterPassword(
+                        rdsResourceRelayKey(member.getDbInstanceArn(), memberId), newPassword);
+            }
+        }
+
         LOG.infov("DB cluster {0} modified", id);
         return cluster;
     }
@@ -2640,6 +2838,11 @@ public class RdsService implements Resettable, ResourceProvider {
                 .filter(Objects::nonNull)
                 .forEach(group -> unique.put(group.getDbClusterParameterGroupName(), group));
         return unique.values();
+    }
+
+    /** Whether a name is one of the default cluster parameter groups the service itself provides. */
+    public boolean isManagedClusterParameterGroup(String name) {
+        return managedClusterParameterGroup(name) != null;
     }
 
     private static ManagedClusterParameterGroup managedClusterParameterGroup(String name) {

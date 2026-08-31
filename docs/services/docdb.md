@@ -34,6 +34,19 @@ The management API shares the RDS Query endpoint (`POST /` with an `Action=` par
 | `RemoveTagsFromResource` | Remove tags by key from a cluster or instance |
 <!-- floci:actions:end -->
 
+`CreateDBCluster` stores `DBSubnetGroupName`, `DBClusterParameterGroupName`, `VpcSecurityGroupIds`,
+`StorageEncrypted`, `KmsKeyId` (resolved to the key ARN), `BackupRetentionPeriod`, both windows,
+`Port`, `DeletionProtection` and `Tags`, and `DescribeDBClusters` returns them; `ModifyDBCluster`
+changes the ones AWS lets change. References are checked as on AWS (the subnet group and cluster
+parameter group are the RDS records, security groups are EC2's, the key must exist and be enabled),
+and so are the windows (30-minute minimum, no overlap). Omitted values take the AWS defaults —
+`default`, `default.docdb<family>`, the VPC's default security group, one day of backups — with
+deterministic windows `04:00-06:00` / `mon:00:00-mon:03:00` where AWS picks random ones.
+`CreateDBInstance` keeps `AutoMinorVersionUpgrade`, `PreferredMaintenanceWindow`,
+`CopyTagsToSnapshot`, `PromotionTier` and `Tags`. `EngineVersion` must be one a live account lists
+(`3.6.0`, `4.0.0`, `5.0.0`, `5.0.1`, `8.0.0`, `8.0.1`, or the `major.minor` form of one); any other
+is refused with `Cannot find version X for docdb`, on create and on modify.
+
 ## Configuration
 
 | Variable | Default | Description |

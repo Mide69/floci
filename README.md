@@ -141,6 +141,8 @@ Lambda, RDS, Neptune, ElastiCache, MSK, ECS, EC2, EKS, OpenSearch, CodeBuild, an
 
 Point standard AWS clients at `http://localhost:4566`. Existing credentials, regions, SDKs, CLI commands, and IaC workflows stay familiar.
 
+Terraform can provision AWS-shaped resources locally through Floci using the standard HashiCorp AWS provider. See the [Terraform with Floci guide](docs/getting-started/terraform.md) for provider configuration, resource examples, and optional emulated S3 state.
+
 </details>
 
 <details>
@@ -178,7 +180,7 @@ LocalStack's community edition [sunset in March 2026](https://blog.localstack.cl
 | CodeBuild | Real Docker execution | No |
 | Native binary | ~40 MB | No |
 
-**82 AWS services. Broad coverage. Free forever.**
+**84 AWS services. Broad coverage. Free forever.**
 
 ## Architecture Overview
 
@@ -300,7 +302,7 @@ For operation-level compatibility, see the [Services Overview](https://floci.io/
 | Elastic Beanstalk | In-process | Applications, application versions, environments, configuration templates, platform and solution stack metadata |
 | AWS Backup | In-process | Vaults, backup plans, selections, simulated job lifecycle, recovery points |
 | AWS FIS | In-process | All 26 management APIs for templates, experiments, target accounts, action and target discovery, safety lever, tagging, and pagination; experiment execution is a safe control-plane simulation and does not inject faults into other services |
-| AWS Config | In-process | Config rules, configuration recorders, delivery channels, conformance packs, tagging |
+| AWS Config | In-process | Config rules, evaluation-driven compliance (PutEvaluations, compliance details and summaries), configuration recorders, delivery channels, retention configuration, conformance packs, tagging |
 | Organizations | In-process | Organizations, roots, nested OUs, member accounts, all policy types with `FullAWSAccess` and effective-policy inheritance, trusted service access, delegated administrators, resource policy, and the full invitation/handshake flow; created accounts are usable Floci accounts and member accounts can read the organization they belong to |
 | CloudTrail | In-process | Trails, event selectors (S3 data events with bucket/prefix matching), `StartLogging`/`StopLogging`, scheduled gzipped log file emission to the destination bucket at AWS-shaped key paths, IAM-deny path emits `AccessDenied` records |
 | CloudFront | In-process | Distributions, origins, cache behaviors, invalidations, tagging |
@@ -695,11 +697,11 @@ The [`compatibility-tests`](./compatibility-tests/) directory validates Floci ac
 | `sdk-test-python` | Python 3 | boto3 | 311 |
 | `sdk-test-go` | Go | AWS SDK for Go v2 + RDS Data API SDK v1 | 157 |
 | `sdk-test-awscli` | Bash | AWS CLI v2 | 205 |
-| `compat-terraform` | Terraform | v1.10+ | 22 |
-| `compat-opentofu` | OpenTofu | v1.9+ | 16 |
+| `compat-terraform` | Terraform | v1.10+ | 67 |
+| `compat-opentofu` | OpenTofu | v1.9+ | 41 |
 | `compat-cdk` | AWS CDK | v2+ | 20 |
 
-**2,506 automated compatibility tests across 5 SDKs and 3 IaC tools.**
+**2,576 automated compatibility tests across 5 SDKs and 3 IaC tools.**
 
 ## Migrating from LocalStack
 
@@ -803,30 +805,34 @@ Join the Floci community on [Slack](https://join.slack.com/t/floci/shared_invite
 
 ## Sponsors
 
-Floci is independent open source, funded by its users. If Floci saves you time,
-consider [sponsoring the project](https://github.com/sponsors/floci-io) — every
-tier keeps the emulators fast, light, and free.
+Floci is independent open source, funded by the people and companies who use it.
+Sponsorship buys gratitude and nothing else: every emulated service is free for
+everyone, forever, and no sponsor gets features, priority, or roadmap influence
+that the rest of the Flock does not.
 
 ### 🥇 Gold
 
-Large logo with top placement, a dedicated support channel, input on roadmap
-priorities, and custom integration help.
+Large logo with top placement in the emulator READMEs and on floci.io, plus a
+mention in release notes.
 
-*Your logo here — [become a Gold sponsor](https://github.com/sponsors/floci-io).*
+[IceGuard](https://github.com/iceguard) · [Softmax](https://softmax.com/)
 
 ### 🥈 Silver
 
-Logo in this README and on floci.io, priority issue support, and a mention in
-release notes.
+Logo in the emulator READMEs and on floci.io, plus a mention in release notes.
 
-*Your logo here — [become a Silver sponsor](https://github.com/sponsors/floci-io).*
+*Your logo here. [Become a sponsor](https://github.com/sponsors/floci-io).*
 
 ### 🥉 Community
 
-Name in this README, a sponsor badge on GitHub, and our sincere thanks.
+Name in the emulator READMEs, a sponsor badge on GitHub, and our sincere thanks.
 
-- [Nexxion.ai](https://github.com/Nexxion-ai)
-- [Your name here](https://github.com/sponsors/floci-io)
+[AutoScout24](https://www.autoscout24.com) · [Nexxion AI](https://nexxion.ai/)
+
+Every sponsor, including the Friends of the Flock who support Floci outside these
+tiers, is listed in [THANKS.md](https://github.com/floci-io/.github/blob/main/THANKS.md).
+
+**[Sponsor Floci](https://github.com/sponsors/floci-io)**
 
 ## Star History
 

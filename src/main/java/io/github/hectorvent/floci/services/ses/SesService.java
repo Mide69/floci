@@ -35,6 +35,8 @@ import io.github.hectorvent.floci.services.ses.model.TopicPreference;
 import io.github.hectorvent.floci.services.ses.model.TrackingOptions;
 import io.github.hectorvent.floci.services.ses.model.VdmOptions;
 import io.github.hectorvent.floci.services.ses.model.SentEmail;
+import io.github.hectorvent.floci.services.ses.model.Tenant;
+import io.github.hectorvent.floci.services.ses.model.TenantResourceAssociation;
 import io.github.hectorvent.floci.services.ses.model.SuppressedDestination;
 import io.github.hectorvent.floci.services.ses.model.SuppressionOptions;
 import io.github.hectorvent.floci.services.ses.model.Tag;
@@ -111,6 +113,8 @@ public class SesService {
     // Custom verification email templates: storage extracted to SesCvetService. The
     // facade keeps the identity-dependent validation and the send path; the service owns the store.
     private final SesCvetService cvetService;
+    // Tenants (multi-tenancy) live in SesTenantService. The facade delegates.
+    private final SesTenantService tenantService;
     private final SmtpRelay smtpRelay;
     private final ObjectMapper objectMapper;
     private final SesEventPublisher eventPublisher;
@@ -131,7 +135,7 @@ public class SesService {
                        SesPolicyService policyService, SesContactService contactService,
                        SesSuppressionService suppressionService, SesDedicatedIpService dedicatedIpService,
                        SesTemplateService templateService, SesSentEmailService sentEmailService,
-                       SmtpRelay smtpRelay, ObjectMapper objectMapper,
+                       SesTenantService tenantService, SmtpRelay smtpRelay, ObjectMapper objectMapper,
                        SesEventPublisher eventPublisher, EmulatorConfig config, Route53Service route53Service,
                        RegionResolver regionResolver, Clock clock) {
         this.identityStore = storageFactory.create("ses", "ses-identities.json",
@@ -147,6 +151,7 @@ public class SesService {
         this.policyService = policyService;
         this.receiptRuleService = receiptRuleService;
         this.cvetService = cvetService;
+        this.tenantService = tenantService;
         this.smtpRelay = smtpRelay;
         this.objectMapper = objectMapper;
         this.eventPublisher = eventPublisher;
@@ -168,12 +173,13 @@ public class SesService {
                SesPolicyService policyService,
                SesReceiptRuleService receiptRuleService,
                SesCvetService cvetService,
+               SesTenantService tenantService,
                SmtpRelay smtpRelay,
                ObjectMapper objectMapper,
                Clock clock) {
         this(identityStore, sentEmailService, accountService, templateService, configSetStore, suppressionService,
                 dedicatedIpService, contactService, policyService,
-                receiptRuleService, cvetService, smtpRelay, objectMapper, null, clock);
+                receiptRuleService, cvetService, tenantService, smtpRelay, objectMapper, null, clock);
     }
 
     SesService(StorageBackend<String, Identity> identityStore,
@@ -187,6 +193,7 @@ public class SesService {
                SesPolicyService policyService,
                SesReceiptRuleService receiptRuleService,
                SesCvetService cvetService,
+               SesTenantService tenantService,
                SmtpRelay smtpRelay,
                ObjectMapper objectMapper,
                Route53Service route53Service,
@@ -202,6 +209,7 @@ public class SesService {
         this.policyService = policyService;
         this.receiptRuleService = receiptRuleService;
         this.cvetService = cvetService;
+        this.tenantService = tenantService;
         this.smtpRelay = smtpRelay;
         this.objectMapper = objectMapper;
         this.eventPublisher = null;
@@ -253,6 +261,11 @@ public class SesService {
         if (identityValue == null || identityValue.isBlank()) {
             return;
         }
+        tenantService.deleteBackingResource(SesTenantService.RESOURCE_TYPE_IDENTITY, identityValue,
+                region, () -> doDeleteIdentity(identityValue, region));
+    }
+
+    private void doDeleteIdentity(String identityValue, String region) {
         String key = identityKey(region, identityValue);
         identityStore.delete(key);
         invalidateDkimLookupCache(region, identityValue);
@@ -1178,7 +1191,8 @@ public class SesService {
     }
 
     public void deleteTemplate(String templateName, String region) {
-        templateService.deleteTemplate(templateName, region);
+        tenantService.deleteBackingResource(SesTenantService.RESOURCE_TYPE_TEMPLATE, templateName,
+                region, () -> templateService.deleteTemplate(templateName, region));
     }
 
     public List<EmailTemplate> listTemplates(String region) {
@@ -1627,8 +1641,11 @@ public class SesService {
             throw new AwsException("ConfigurationSetDoesNotExist",
                     "Configuration set <" + name + "> does not exist.", 400);
         }
-        configSetStore.delete(key);
-        LOG.infov("Deleted SES configuration set: {0} in region {1}", name, region);
+        tenantService.deleteBackingResource(SesTenantService.RESOURCE_TYPE_CONFIGURATION_SET, name,
+                region, () -> {
+                    configSetStore.delete(key);
+                    LOG.infov("Deleted SES configuration set: {0} in region {1}", name, region);
+                });
     }
 
     private static final Pattern CONFIG_SET_NAME = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
@@ -1637,6 +1654,188 @@ public class SesService {
         validateConfigurationSetName(name);
         return "configSet::" + region + "::" + name;
     }
+
+    // ──────────────────────── Tenants (multi-tenancy) ────────────────────────
+    // Tenants live in SesTenantService; the facade forwards.
+
+    public Tenant createTenant(String tenantName, List<Tag> tags, List<String> suppressedReasons,
+                               String suppressionScope, String accountId, String region) {
+        return tenantService.createTenant(tenantName, tags, suppressedReasons, suppressionScope,
+                accountId, region);
+    }
+
+    public void putTenantSuppressionAttributes(String tenantName, List<String> suppressedReasons,
+                                               String suppressionScope, String region) {
+        tenantService.putSuppressionAttributes(tenantName, suppressedReasons, suppressionScope, region);
+    }
+
+    public Tenant getTenant(String tenantName, String region) {
+        return tenantService.getTenant(tenantName, region);
+    }
+
+    public List<Tenant> listTenants(String region) {
+        return tenantService.listTenants(region);
+    }
+
+    public void deleteTenant(String tenantName, String region) {
+        // The tenant-scoped suppression entries live in the suppression domain; the callback runs
+        // their cascade inside the tenant lock, before the associations and the tenant record.
+        tenantService.deleteTenant(tenantName, region,
+                tenant -> suppressionService.deleteAllForTenant(region, tenant.tenantId()));
+    }
+
+    // The association operations validate resource existence here in the facade — the tenant domain
+    // owns the association store, but only this class can reach the identity/configuration-set/template
+    // stores without a service→service dependency.
+
+    public void createTenantResourceAssociation(String tenantName, String resourceArn,
+                                                String accountId, String region) {
+        SesTenantService.AssociationResource ref =
+                SesTenantService.parseResourceArn(resourceArn, accountId, region);
+        Tenant tenant = tenantService.tenantForAssociation(tenantName, region);
+        // The existence check runs inside the association lock so it stays atomic with the
+        // backing-resource delete guards.
+        tenantService.associate(tenant, ref, region, () -> requireTenantResourceExists(ref, region));
+    }
+
+    public void deleteTenantResourceAssociation(String tenantName, String resourceArn,
+                                                String accountId, String region) {
+        SesTenantService.AssociationResource ref =
+                SesTenantService.parseResourceArn(resourceArn, accountId, region);
+        Tenant tenant = tenantService.tenantForAssociation(tenantName, region);
+        // AWS still 404s on a missing resource even though removing a missing association succeeds.
+        requireTenantResourceExists(ref, region);
+        tenantService.disassociate(tenant, ref, region);
+    }
+
+    public List<TenantResourceAssociation> listTenantResources(String tenantName,
+                                                               String resourceTypeFilter,
+                                                               Integer pageSize, String nextToken,
+                                                               String region) {
+        SesTenantService.validateListPaging(pageSize, nextToken);
+        SesTenantService.validateResourceTypeFilter(resourceTypeFilter);
+        Tenant tenant = tenantService.tenantForAssociation(tenantName, region);
+        return tenantService.listTenantResources(tenant, resourceTypeFilter, region);
+    }
+
+    public List<TenantResourceAssociation> listResourceTenants(String resourceArn, Integer pageSize,
+                                                               String nextToken, String accountId,
+                                                               String region) {
+        SesTenantService.validateListPaging(pageSize, nextToken);
+        SesTenantService.AssociationResource ref =
+                SesTenantService.parseResourceArn(resourceArn, accountId, region);
+        requireTenantResourceExists(ref, region);
+        return tenantService.listResourceTenants(ref, region);
+    }
+
+    /**
+     * The tenant send gate (Phase 4): resolves the tenant with the send-flavored not-found wording,
+     * then requires every resource the send uses to be associated with it. The tenant's
+     * SendingStatus is not checked — no API can move it off ENABLED, so the DISABLED gate is not
+     * emulated. Placement is probe-confirmed: request-shape validation (a missing Content, an empty
+     * inline template, a missing FromEmailAddress on Simple, the bulk template-content checks) runs
+     * before the tenant lookup, while the recipient checks, the raw MIME-From derivation, and
+     * identity verification all lose to the tenant 404.
+     */
+    public void checkTenantSendAccess(String tenantName, String fromEmailAddress,
+                                      String configurationSetName, String templateName,
+                                      String accountId, String region) {
+        if (tenantName == null) {
+            return;
+        }
+        Tenant tenant = tenantService.tenantForSending(tenantName, region, accountId);
+        String arnPrefix = "arn:aws:ses:" + region + ":" + accountId + ":";
+        List<SesTenantService.AssociationResource> used = new ArrayList<>();
+        if (fromEmailAddress != null && !fromEmailAddress.isBlank()) {
+            String identityName = sendIdentityName(fromEmailAddress, region);
+            used.add(new SesTenantService.AssociationResource(
+                    SesTenantService.RESOURCE_TYPE_IDENTITY, identityName,
+                    arnPrefix + "identity/" + identityName));
+        }
+        // The gate covers the EFFECTIVE configuration set: an omitted name resolves to the sender
+        // identity's default, and that one needs the association just as an explicit one does.
+        String effectiveConfigSet =
+                resolveDefaultConfigurationSet(configurationSetName, fromEmailAddress, region);
+        if (effectiveConfigSet != null && !effectiveConfigSet.isBlank()) {
+            used.add(new SesTenantService.AssociationResource(
+                    SesTenantService.RESOURCE_TYPE_CONFIGURATION_SET, effectiveConfigSet,
+                    arnPrefix + "configuration-set/" + effectiveConfigSet));
+        }
+        if (templateName != null && !templateName.isBlank()) {
+            used.add(new SesTenantService.AssociationResource(
+                    SesTenantService.RESOURCE_TYPE_TEMPLATE, templateName,
+                    arnPrefix + "template/" + templateName));
+        }
+        tenantService.requireResourcesAssociated(tenant, used, region);
+    }
+
+    /**
+     * The raw-content variant of the tenant send gate: when {@code FromEmailAddress} is omitted,
+     * the effective sender comes from the MIME {@code From} header — the same derivation
+     * {@code sendRawEmail} applies — so the gate must resolve it the same way before checking.
+     */
+    public void checkTenantRawSendAccess(String tenantName, String fromEmailAddress,
+                                         String rawMessage, String configurationSetName,
+                                         String accountId, String region) {
+        if (tenantName == null) {
+            return;
+        }
+        String effectiveSource = fromEmailAddress;
+        if (effectiveSource == null || effectiveSource.isBlank()) {
+            SmtpRelay.RawMessageHeaders headers = SmtpRelay.parseRawHeaders(rawMessage);
+            effectiveSource = headers != null && !headers.from().isBlank() ? headers.from() : null;
+        }
+        checkTenantSendAccess(tenantName, effectiveSource, configurationSetName, null,
+                accountId, region);
+    }
+
+    // The gate names the identity the way AWS did in the probed error: the exact address identity
+    // when one exists, otherwise the domain identity the address falls under. The sender may carry
+    // display-name syntax ("Name <a@b>"), so the bare address is extracted first.
+    private String sendIdentityName(String fromEmailAddress, String region) {
+        String email = extractEmailAddress(fromEmailAddress);
+        if (email.isBlank()) {
+            return fromEmailAddress.trim();
+        }
+        if (identityStore.get(identityKey(region, email)).isPresent()) {
+            return email;
+        }
+        int at = email.lastIndexOf('@');
+        if (at >= 0) {
+            String domain = email.substring(at + 1);
+            if (identityStore.get(identityKey(region, domain)).isPresent()) {
+                return domain;
+            }
+        }
+        return email;
+    }
+
+    // The association APIs 404 with a per-type message when the referenced resource is missing; the
+    // trailing colon on the configuration-set variant is AWS's own.
+    private void requireTenantResourceExists(SesTenantService.AssociationResource ref, String region) {
+        boolean exists = switch (ref.type()) {
+            case SesTenantService.RESOURCE_TYPE_IDENTITY ->
+                    identityStore.get(identityKey(region, ref.name())).isPresent();
+            case SesTenantService.RESOURCE_TYPE_CONFIGURATION_SET ->
+                    CONFIG_SET_NAME.matcher(ref.name()).matches()
+                            && configSetStore.get(configSetKey(region, ref.name())).isPresent();
+            case SesTenantService.RESOURCE_TYPE_TEMPLATE ->
+                    templateService.find(ref.name(), region).isPresent();
+            default -> false;
+        };
+        if (exists) {
+            return;
+        }
+        String message = switch (ref.type()) {
+            case SesTenantService.RESOURCE_TYPE_IDENTITY ->
+                    "Identity <" + ref.name() + "> does not exist";
+            case SesTenantService.RESOURCE_TYPE_CONFIGURATION_SET ->
+                    "Configuration set <" + ref.name() + "> does not exist:";
+            default -> "Email template <" + ref.name() + "> does not exist";
+        };
+        throw new AwsException("NotFoundException", message, 404);
+    }
+
 
     // ──────────────────────── Receipt rule sets (inbound) ────────────────────────
     //
@@ -2265,20 +2464,78 @@ public class SesService {
         suppressionService.putAccountSuppressionAttributes(region, suppressedReasons);
     }
 
+    // A TenantName routes each suppression-list operation to that tenant's own list (fully separate
+    // from the account list on AWS); the reason/address validation still runs first, matching the
+    // probed precedence where request validation precedes tenant existence.
+
     public void putSuppressedDestination(String region, String emailAddress, String reason) {
-        suppressionService.putSuppressedDestination(region, emailAddress, reason);
+        putSuppressedDestination(region, emailAddress, reason, null);
     }
 
     public SuppressedDestination getSuppressedDestination(String region, String emailAddress) {
-        return suppressionService.getSuppressedDestination(region, emailAddress);
+        return getSuppressedDestination(region, emailAddress, null);
     }
 
     public void deleteSuppressedDestination(String region, String emailAddress) {
-        suppressionService.deleteSuppressedDestination(region, emailAddress);
+        deleteSuppressedDestination(region, emailAddress, null);
     }
 
-    public List<SuppressedDestination> listSuppressedDestinations(String region, List<String> reasonFilters) {
-        return suppressionService.listSuppressedDestinations(region, reasonFilters);
+    public List<SuppressedDestination> listSuppressedDestinations(String region,
+                                                                  List<String> reasonFilters) {
+        return listSuppressedDestinations(region, reasonFilters, null);
+    }
+
+    public void putSuppressedDestination(String region, String emailAddress, String reason,
+                                         String tenantName) {
+        if (tenantName == null) {
+            suppressionService.putSuppressedDestination(region, emailAddress, reason);
+            return;
+        }
+        // The address and reason are validated before the tenant is resolved, keeping request
+        // validation ahead of tenant existence for every member, as on the attribute operations.
+        SesSuppressionService.normalizeSuppressionEmail(emailAddress);
+        SesSuppressionService.validateSuppressionReason(reason, "reason", false);
+        tenantService.runWithTenant(tenantName, region, tenant -> {
+            suppressionService.putTenantSuppressedDestination(region, tenant.tenantId(),
+                    tenantName, emailAddress, reason);
+            return null;
+        });
+    }
+
+    public SuppressedDestination getSuppressedDestination(String region, String emailAddress,
+                                                          String tenantName) {
+        if (tenantName == null) {
+            return suppressionService.getSuppressedDestination(region, emailAddress);
+        }
+        SesSuppressionService.normalizeSuppressionEmail(emailAddress);
+        return tenantService.runWithTenant(tenantName, region, tenant ->
+                suppressionService.getTenantSuppressedDestination(region, tenant.tenantId(),
+                        emailAddress));
+    }
+
+    public void deleteSuppressedDestination(String region, String emailAddress, String tenantName) {
+        if (tenantName == null) {
+            suppressionService.deleteSuppressedDestination(region, emailAddress);
+            return;
+        }
+        SesSuppressionService.normalizeSuppressionEmail(emailAddress);
+        tenantService.runWithTenant(tenantName, region, tenant -> {
+            suppressionService.deleteTenantSuppressedDestination(region, tenant.tenantId(),
+                    emailAddress);
+            return null;
+        });
+    }
+
+    public List<SuppressedDestination> listSuppressedDestinations(String region,
+                                                                  List<String> reasonFilters,
+                                                                  String tenantName) {
+        if (tenantName == null) {
+            return suppressionService.listSuppressedDestinations(region, reasonFilters);
+        }
+        SesSuppressionService.validateReasonFilters(reasonFilters);
+        return tenantService.runWithTenant(tenantName, region, tenant ->
+                suppressionService.listTenantSuppressedDestinations(region, tenant.tenantId(),
+                        reasonFilters));
     }
 
     /**
@@ -2637,13 +2894,12 @@ public class SesService {
         return "===_floci_" + HexFormat.of().formatHex(bytes) + "_===";
     }
 
-    public String sendInlineTemplatedEmail(String source, List<String> toAddresses, List<String> ccAddresses,
-                                            List<String> bccAddresses, List<String> replyToAddresses,
-                                            String subject, String textPart, String htmlPart,
-                                            JsonNode templateData,
-                                            String configurationSetName, List<MessageTag> emailTags,
-                                            List<MessageHeader> additionalHeaders,
-                                            ListManagementOptions listManagement, String region) {
+    /**
+     * Also called by the controller ahead of the tenant send gate: AWS reports an empty inline
+     * template before it looks the tenant up (probe-confirmed), so the check must not stay behind
+     * the gate for tenant sends.
+     */
+    static void requireInlineTemplateContent(String subject, String textPart, String htmlPart) {
         boolean hasSubject = subject != null && !subject.isBlank();
         boolean hasText = textPart != null && !textPart.isBlank();
         boolean hasHtml = htmlPart != null && !htmlPart.isBlank();
@@ -2651,6 +2907,16 @@ public class SesService {
             throw new AwsException("InvalidTemplate",
                     "Template must have at least a subject, text, or html part.", 400);
         }
+    }
+
+    public String sendInlineTemplatedEmail(String source, List<String> toAddresses, List<String> ccAddresses,
+                                            List<String> bccAddresses, List<String> replyToAddresses,
+                                            String subject, String textPart, String htmlPart,
+                                            JsonNode templateData,
+                                            String configurationSetName, List<MessageTag> emailTags,
+                                            List<MessageHeader> additionalHeaders,
+                                            ListManagementOptions listManagement, String region) {
+        requireInlineTemplateContent(subject, textPart, htmlPart);
         return sendEmail(source, toAddresses, ccAddresses, bccAddresses, replyToAddresses,
                 applyTemplateData(subject, templateData),
                 applyTemplateData(textPart, templateData),
@@ -2670,13 +2936,7 @@ public class SesService {
         if (source == null || source.isBlank()) {
             throw new AwsException("InvalidParameterValue", "Source email is required.", 400);
         }
-        boolean hasSubject = subject != null && !subject.isBlank();
-        boolean hasText = textPart != null && !textPart.isBlank();
-        boolean hasHtml = htmlPart != null && !htmlPart.isBlank();
-        if (!hasSubject && !hasText && !hasHtml) {
-            throw new AwsException("InvalidTemplate",
-                    "Template must have at least a subject, text, or html part.", 400);
-        }
+        requireInlineTemplateContent(subject, textPart, htmlPart);
         if (entries == null || entries.isEmpty()) {
             throw new AwsException("InvalidParameterValue",
                     "At least one destination entry is required.", 400);
