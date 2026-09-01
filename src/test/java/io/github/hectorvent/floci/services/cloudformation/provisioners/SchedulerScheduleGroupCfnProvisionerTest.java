@@ -220,6 +220,31 @@ class SchedulerScheduleGroupCfnProvisionerTest {
     }
 
     @Test
+    void sameStackRetryWithUnresolvableTagsDoesNotUntagExistingTags() {
+        // Greptile review on PR #2796: the engine's Fn::If support is scalar-only, so a Tags
+        // property wrapped in Fn::If (choosing between two tag lists) does not resolve to an array
+        // here - props.get("Tags").isArray() is false, same as no Tags at all. Before this test, that
+        // made the retry path's tag-diff see an empty desired set and untag every live key, actively
+        // destroying tags a resolvable Tags property never asked to remove.
+        when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1")))
+                .thenThrow(new AwsException("ConflictException", "already exists", 409));
+        when(schedulerService.getScheduleGroup("my-group", "us-east-1"))
+                .thenReturn(group("my-group", Map.of("Old", "value")));
+        StackResource r = resource("MyGroup");
+        r.setPhysicalId("my-group");
+        ObjectNode props = mapper.createObjectNode().put("Name", "my-group");
+        ObjectNode condition = mapper.createObjectNode();
+        condition.set("Fn::If", mapper.createArrayNode().add("UseProdTags")
+                .add(mapper.createArrayNode()).add(mapper.createArrayNode()));
+        props.set("Tags", condition);
+
+        provisioner.provision(r, props, ctx());
+
+        verify(schedulerService, never()).untagScheduleGroup(anyString(), anyString(), any());
+        verify(schedulerService, never()).tagScheduleGroup(anyString(), anyString(), any());
+    }
+
+    @Test
     void sameStackRetryWithNoTagChangesDoesNotCallUntagOrTag() {
         when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1")))
                 .thenThrow(new AwsException("ConflictException", "already exists", 409));
