@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -121,6 +122,117 @@ class SchedulerScheduleGroupCfnProvisionerTest {
         assertEquals("my-group", r.getPhysicalId());
         assertEquals("arn:aws:scheduler:us-east-1:000000000000:schedule-group/my-group",
                 r.getAttributes().get("Arn"));
+    }
+
+    @Test
+    void createSetsCreationDateLastModificationDateAndState() {
+        // pgermosen review on PR #2796: real AWS's Fn::GetAtt for AWS::Scheduler::ScheduleGroup
+        // supports Arn, CreationDate, LastModificationDate and State; only Arn was populated,
+        // so Fn::GetAtt MyGroup.State resolved to nothing.
+        Instant created = Instant.parse("2026-01-01T00:00:00Z");
+        Instant modified = Instant.parse("2026-01-02T00:00:00Z");
+        ScheduleGroup g = new ScheduleGroup("my-group",
+                "arn:aws:scheduler:us-east-1:000000000000:schedule-group/my-group",
+                "ACTIVE", created, modified);
+        when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1"))).thenReturn(g);
+        StackResource r = resource("MyGroup");
+        ObjectNode props = mapper.createObjectNode().put("Name", "my-group");
+
+        provisioner.provision(r, props, ctx());
+
+        assertEquals(created.toString(), r.getAttributes().get("CreationDate"));
+        assertEquals(modified.toString(), r.getAttributes().get("LastModificationDate"));
+        assertEquals("ACTIVE", r.getAttributes().get("State"));
+    }
+
+    @Test
+    void tagsWithIntrinsicKeyOrValueAreResolvedThroughTheEngine() {
+        // pgermosen review on PR #2796 raised this as a gap; the loop already calls
+        // ctx.engine().resolve(...) for both Key and Value, so this pins that a Ref/Fn::Sub node
+        // resolves to the engine's answer rather than a raw JsonNode-to-text conversion of the
+        // intrinsic object itself.
+        when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1")))
+                .thenReturn(group("my-group", Map.of()));
+        StackResource r = resource("MyGroup");
+        ObjectNode props = mapper.createObjectNode().put("Name", "my-group");
+        ObjectNode keyRef = mapper.createObjectNode();
+        keyRef.put("Ref", "TagKeyParam");
+        ObjectNode valueSub = mapper.createObjectNode();
+        valueSub.put("Fn::Sub", "env-${AWS::Region}");
+        ObjectNode tag = mapper.createObjectNode();
+        tag.set("Key", keyRef);
+        tag.set("Value", valueSub);
+        props.set("Tags", mapper.createArrayNode().add(tag));
+
+        CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
+        when(engine.resolve(any())).thenAnswer(inv -> {
+            JsonNode node = inv.getArgument(0);
+            return node == null ? null : node.asText();
+        });
+        when(engine.resolve(keyRef)).thenReturn("resolved-key");
+        when(engine.resolve(valueSub)).thenReturn("env-us-east-1");
+        ProvisionContext ctx = new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
+
+        provisioner.provision(r, props, ctx);
+
+        verify(schedulerService).createScheduleGroup(
+                "my-group", Map.of("resolved-key", "env-us-east-1"), "us-east-1");
+    }
+
+    @Test
+    void sameStackRetryRemovesTagsDroppedFromTheTemplate() {
+        // pgermosen review on PR #2796: the retry path only ever added tags on conflict, so a tag
+        // removed from the template stayed on the live resource across every subsequent update.
+        when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1")))
+                .thenThrow(new AwsException("ConflictException", "already exists", 409));
+        when(schedulerService.getScheduleGroup("my-group", "us-east-1"))
+                .thenReturn(group("my-group", Map.of("Old", "value", "Keep", "same")));
+        StackResource r = resource("MyGroup");
+        r.setPhysicalId("my-group");
+        ObjectNode props = mapper.createObjectNode().put("Name", "my-group");
+        ObjectNode tag = mapper.createObjectNode().put("Key", "Keep").put("Value", "same");
+        props.set("Tags", mapper.createArrayNode().add(tag));
+
+        provisioner.provision(r, props, ctx());
+
+        verify(schedulerService).untagScheduleGroup(eq("my-group"), eq("us-east-1"),
+                argThat(keys -> keys.size() == 1 && keys.contains("Old")));
+        verify(schedulerService).tagScheduleGroup("my-group", "us-east-1", Map.of("Keep", "same"));
+    }
+
+    @Test
+    void sameStackRetryWithEmptyTemplateTagsRemovesAllExistingTags() {
+        // The Tags property emptied entirely on the template is the same case as a dropped key,
+        // just for every key at once - the whole existing tag set must come off.
+        when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1")))
+                .thenThrow(new AwsException("ConflictException", "already exists", 409));
+        when(schedulerService.getScheduleGroup("my-group", "us-east-1"))
+                .thenReturn(group("my-group", Map.of("Old", "value")));
+        StackResource r = resource("MyGroup");
+        r.setPhysicalId("my-group");
+        ObjectNode props = mapper.createObjectNode().put("Name", "my-group");
+
+        provisioner.provision(r, props, ctx());
+
+        verify(schedulerService).untagScheduleGroup(eq("my-group"), eq("us-east-1"),
+                argThat(keys -> keys.size() == 1 && keys.contains("Old")));
+        verify(schedulerService, never()).tagScheduleGroup(anyString(), anyString(), any());
+    }
+
+    @Test
+    void sameStackRetryWithNoTagChangesDoesNotCallUntagOrTag() {
+        when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1")))
+                .thenThrow(new AwsException("ConflictException", "already exists", 409));
+        when(schedulerService.getScheduleGroup("my-group", "us-east-1"))
+                .thenReturn(group("my-group", Map.of()));
+        StackResource r = resource("MyGroup");
+        r.setPhysicalId("my-group");
+        ObjectNode props = mapper.createObjectNode().put("Name", "my-group");
+
+        provisioner.provision(r, props, ctx());
+
+        verify(schedulerService, never()).untagScheduleGroup(anyString(), anyString(), any());
+        verify(schedulerService, never()).tagScheduleGroup(anyString(), anyString(), any());
     }
 
     @Test

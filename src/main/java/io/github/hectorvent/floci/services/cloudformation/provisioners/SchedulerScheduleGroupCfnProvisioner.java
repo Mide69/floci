@@ -9,7 +9,9 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -67,12 +69,29 @@ public class SchedulerScheduleGroupCfnProvisioner implements CfnResourceProvisio
             // own group already exists from an earlier attempt. Adopt it instead of failing the whole
             // stack on a retry of a step that already succeeded.
             group = schedulerService.getScheduleGroup(name, ctx.region());
+            // Reconcile tags both ways: a key dropped from the template (or the whole Tags list
+            // emptied) must not linger on the live resource, matching how the same-stack retry
+            // path applies every other property change rather than only ever adding.
+            Set<String> staleKeys = new HashSet<>(group.getTags().keySet());
+            staleKeys.removeAll(tags.keySet());
+            if (!staleKeys.isEmpty()) {
+                schedulerService.untagScheduleGroup(name, ctx.region(), new ArrayList<>(staleKeys));
+            }
             if (!tags.isEmpty()) {
                 schedulerService.tagScheduleGroup(name, ctx.region(), tags);
             }
         }
         r.setPhysicalId(group.getName());
         r.getAttributes().put("Arn", group.getArn());
+        if (group.getCreationDate() != null) {
+            r.getAttributes().put("CreationDate", group.getCreationDate().toString());
+        }
+        if (group.getLastModificationDate() != null) {
+            r.getAttributes().put("LastModificationDate", group.getLastModificationDate().toString());
+        }
+        if (group.getState() != null) {
+            r.getAttributes().put("State", group.getState());
+        }
     }
 
     @Override
