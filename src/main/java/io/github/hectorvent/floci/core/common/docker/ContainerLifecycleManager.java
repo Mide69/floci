@@ -174,9 +174,10 @@ public class ContainerLifecycleManager {
     /**
      * Starts a container, translating crun/runc's kernel-keyring-quota error into a message that
      * names the actual cause and a fix, instead of the misleading "Disk quota exceeded" the OCI
-     * runtime reports.
+     * runtime reports. Package-private so tests can verify a given call site routes through this
+     * translation rather than a raw {@code dockerClient.startContainerCmd(...)} call.
      */
-    private void startContainer(String containerId) {
+    void startContainer(String containerId) {
         try {
             dockerClient.startContainerCmd(containerId).exec();
         } catch (DockerException e) {
@@ -412,7 +413,7 @@ public class ContainerLifecycleManager {
                 .exec();
         String helperId = created.getId();
         try {
-            dockerClient.startContainerCmd(helperId).exec();
+            startContainer(helperId);
             Integer status = dockerClient.waitContainerCmd(helperId)
                     .exec(new WaitContainerResultCallback())
                     .awaitStatusCode(60, TimeUnit.SECONDS);
