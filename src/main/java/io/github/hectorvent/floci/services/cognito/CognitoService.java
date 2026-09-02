@@ -594,6 +594,7 @@ public class CognitoService implements ResourceProvider {
     }
 
     public List<UserPoolClient> listUserPoolClients(String userPoolId) {
+        describeUserPool(userPoolId);
         return clientStore.scan(k -> clientStore.get(k).map(c -> c.getUserPoolId().equals(userPoolId)).orElse(false));
     }
 
@@ -1604,6 +1605,7 @@ public class CognitoService implements ResourceProvider {
     }
 
     public List<CognitoUser> listUsers(String userPoolId, String filter) {
+        describeUserPool(userPoolId);
         String prefix = userPoolId + "::";
         List<CognitoUser> all = userStore.scan(k -> k.startsWith(prefix));
         if (filter == null || filter.isBlank()) {
