@@ -47,19 +47,20 @@ public class SchedulerScheduleGroupCfnProvisioner implements CfnResourceProvisio
                     ? r.getPhysicalId()
                     : ctx.generatePhysicalName(r.getLogicalId(), 64, false);
         }
-        // Tags wrapped in an intrinsic (e.g. Fn::If choosing between two tag lists) is not resolved
-        // here: the engine's Fn::If support is scalar-only, so a conditional list would collapse to
-        // a string rather than the chosen array. tagsAreResolvable is true both when Tags is absent
-        // (the template genuinely wants no tags) and when it is a plain array (the template's actual
-        // desired tags), and false only when Tags is present but not a plain array - the one case
-        // where the desired state genuinely cannot be read, so the retry path below must not treat
-        // "couldn't resolve the intended tags" as "the intended tags are empty" and delete everything
-        // live.
+        // resolveNode unwraps an Fn::If (e.g. choosing between two tag lists) down to its actual
+        // chosen branch rather than collapsing it to a string, so a conditional Tags list resolves
+        // to a real array here. tagsAreResolvable is true both when Tags is absent (the template
+        // genuinely wants no tags) and when the resolved value is an array (the template's actual
+        // desired tags), and false only when Tags is present but resolves to something else - the
+        // one case where the desired state genuinely cannot be read (a single-branch scalar, say),
+        // so the retry path below must not treat "couldn't resolve the intended tags" as "the
+        // intended tags are empty" and delete everything live.
         boolean hasTagsProperty = props != null && props.has("Tags");
-        boolean tagsAreResolvable = !hasTagsProperty || props.get("Tags").isArray();
+        JsonNode resolvedTags = hasTagsProperty ? ctx.engine().resolveNode(props.get("Tags")) : null;
+        boolean tagsAreResolvable = !hasTagsProperty || (resolvedTags != null && resolvedTags.isArray());
         Map<String, String> tags = new HashMap<>();
         if (hasTagsProperty && tagsAreResolvable) {
-            for (JsonNode tag : props.get("Tags")) {
+            for (JsonNode tag : resolvedTags) {
                 String key = ctx.engine().resolve(tag.path("Key"));
                 if (!key.isEmpty()) {
                     tags.put(key, ctx.engine().resolve(tag.path("Value")));

@@ -120,8 +120,17 @@ public class CloudFormationTemplateEngine {
             return node;
         }
         if (node.isObject()) {
+            if (node.has("Fn::If")) {
+                // Unlike the other intrinsics below, Fn::If's two branches can be any JSON shape
+                // (array, object, or scalar) - it just forwards one of them verbatim. Collapsing it
+                // through resolve() like the scalar-only intrinsics would stringify a chosen array or
+                // object instead of preserving it, so a conditional list (e.g. a Tags property) reads
+                // as unresolvable everywhere a caller checks isArray() on the result.
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch == null ? TextNode.valueOf("") : resolveNode(branch);
+            }
             if (node.has("Ref") || node.has("Fn::Sub") || node.has("Fn::Join") ||
-                    node.has("Fn::Select") || node.has("Fn::If") || node.has("Fn::Base64") ||
+                    node.has("Fn::Select") || node.has("Fn::Base64") ||
                     node.has("Fn::GetAtt") || node.has("Fn::ImportValue") || node.has("Fn::Split") ||
                     node.has("Fn::GetAZs") || node.has("Fn::Cidr") || node.has("Fn::FindInMap")) {
                 return TextNode.valueOf(resolve(node));
@@ -375,12 +384,19 @@ public class CloudFormationTemplateEngine {
     }
 
     private String resolveIf(JsonNode ifNode) {
+        JsonNode branch = selectIfBranch(ifNode);
+        return branch == null ? "" : resolve(branch);
+    }
+
+    /** Picks Fn::If's true/false branch without resolving it further, so the caller decides
+     *  whether to collapse it to a scalar ({@link #resolve}) or preserve its shape ({@link #resolveNode}). */
+    private JsonNode selectIfBranch(JsonNode ifNode) {
         if (!ifNode.isArray() || ifNode.size() < 3) {
-            return "";
+            return null;
         }
         String conditionName = ifNode.get(0).asText();
         boolean condValue = conditions.getOrDefault(conditionName, false);
-        return resolve(condValue ? ifNode.get(1) : ifNode.get(2));
+        return condValue ? ifNode.get(1) : ifNode.get(2);
     }
 
     private String resolveGetAtt(JsonNode getAtt) {

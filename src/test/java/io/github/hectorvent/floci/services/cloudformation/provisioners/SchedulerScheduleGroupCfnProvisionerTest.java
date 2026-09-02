@@ -44,6 +44,10 @@ class SchedulerScheduleGroupCfnProvisionerTest {
             JsonNode node = inv.getArgument(0);
             return node == null ? null : node.asText();
         });
+        // Identity passthrough: none of these tests exercise Fn::If's array-preserving behavior
+        // (that is pinned directly against the real engine in CloudFormationTemplateEngineTest), so
+        // a plain Tags array here just needs to come back unchanged for the provisioner to iterate.
+        when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         return new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
     }
 
@@ -169,6 +173,7 @@ class SchedulerScheduleGroupCfnProvisionerTest {
             JsonNode node = inv.getArgument(0);
             return node == null ? null : node.asText();
         });
+        when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         when(engine.resolve(keyRef)).thenReturn("resolved-key");
         when(engine.resolve(valueSub)).thenReturn("env-us-east-1");
         ProvisionContext ctx = new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
@@ -177,6 +182,37 @@ class SchedulerScheduleGroupCfnProvisionerTest {
 
         verify(schedulerService).createScheduleGroup(
                 "my-group", Map.of("resolved-key", "env-us-east-1"), "us-east-1");
+    }
+
+    @Test
+    void conditionalTagsResolvedByTheEngineAreApplied() {
+        // Greptile review on PR #2796: an Fn::If-wrapped Tags property must still be applied, not
+        // just left alone (that half is sameStackRetryWithUnresolvableTagsDoesNotUntagExistingTags).
+        // CloudFormationTemplateEngine.resolveNode now unwraps Fn::If to the chosen branch's real
+        // array (pinned directly against the real engine in CloudFormationTemplateEngineTest); this
+        // proves the provisioner applies whatever resolveNode hands back for an Fn::If input, the
+        // same as it would for a plain array.
+        when(schedulerService.createScheduleGroup(eq("my-group"), any(), eq("us-east-1")))
+                .thenReturn(group("my-group", Map.of()));
+        StackResource r = resource("MyGroup");
+        ObjectNode props = mapper.createObjectNode().put("Name", "my-group");
+        ObjectNode ifTags = mapper.createObjectNode();
+        ifTags.set("Fn::If", mapper.createArrayNode().add("UseProdTags")
+                .add(mapper.createArrayNode()).add(mapper.createArrayNode()));
+        props.set("Tags", ifTags);
+
+        CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
+        when(engine.resolve(any())).thenAnswer(inv -> {
+            JsonNode node = inv.getArgument(0);
+            return node == null ? null : node.asText();
+        });
+        ObjectNode resolvedTag = mapper.createObjectNode().put("Key", "Env").put("Value", "prod");
+        when(engine.resolveNode(ifTags)).thenReturn(mapper.createArrayNode().add(resolvedTag));
+        ProvisionContext ctx = new ProvisionContext(engine, "us-east-1", "000000000000", "my-stack");
+
+        provisioner.provision(r, props, ctx);
+
+        verify(schedulerService).createScheduleGroup("my-group", Map.of("Env", "prod"), "us-east-1");
     }
 
     @Test
