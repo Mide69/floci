@@ -9,6 +9,7 @@ import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CloudFormationTemplateEngineTest {
 
@@ -87,5 +88,58 @@ class CloudFormationTemplateEngineTest {
     void resolveJsonAttributeReturnsNullForMissingOrNullNode() {
         assertNull(engine().resolveJsonAttribute(json("null")));
         assertNull(engine().resolveJsonAttribute(mapper.createArrayNode().path("nope")));
+    }
+
+    private CloudFormationTemplateEngine engineWithCondition(String name, boolean value) {
+        return new CloudFormationTemplateEngine("000000000000", "us-east-1", "my-stack",
+                "stack/id", Map.of(), Map.of(), Map.of(), Map.of(name, value), Map.of(), mapper,
+                (Function<String, String>) n -> null);
+    }
+
+    @Test
+    void resolveFnIfPicksTheTrueBranchScalar() {
+        assertEquals("prod", engineWithCondition("UseProd", true)
+                .resolve(json("{\"Fn::If\": [\"UseProd\", \"prod\", \"dev\"]}")));
+    }
+
+    @Test
+    void resolveFnIfPicksTheFalseBranchScalar() {
+        assertEquals("dev", engineWithCondition("UseProd", false)
+                .resolve(json("{\"Fn::If\": [\"UseProd\", \"prod\", \"dev\"]}")));
+    }
+
+    @Test
+    void resolveNodePreservesArrayShapeThroughFnIf() {
+        // github.com/floci-io/floci/issues/2396 (PR #2796 review): resolveNode treated Fn::If the
+        // same as every other intrinsic and collapsed it to a stringified scalar, so a conditional
+        // array (e.g. a Tags property choosing between two tag lists) resolved to text instead of
+        // the chosen branch's actual array - every caller checking isArray() on the result then
+        // read a resolvable conditional list as unresolvable.
+        JsonNode ifNode = json("""
+                {"Fn::If": ["UseProdTags",
+                    [{"Key": "Env", "Value": "prod"}],
+                    [{"Key": "Env", "Value": "dev"}]]}
+                """);
+
+        JsonNode trueResolved = engineWithCondition("UseProdTags", true).resolveNode(ifNode);
+        assertTrue(trueResolved.isArray(), "true branch must resolve to a real array: " + trueResolved);
+        assertEquals("prod", trueResolved.get(0).get("Value").asText());
+
+        JsonNode falseResolved = engineWithCondition("UseProdTags", false).resolveNode(ifNode);
+        assertTrue(falseResolved.isArray(), "false branch must resolve to a real array: " + falseResolved);
+        assertEquals("dev", falseResolved.get(0).get("Value").asText());
+    }
+
+    @Test
+    void resolveNodeResolvesIntrinsicsInsideTheChosenFnIfBranch() {
+        // The chosen branch is passed back through resolveNode, not returned verbatim, so a nested
+        // intrinsic inside it (e.g. a Ref-valued tag) still resolves.
+        JsonNode ifNode = json("""
+                {"Fn::If": ["UseProdTags", [{"Key": "Env", "Value": {"Ref": "AWS::Region"}}], []]}
+                """);
+
+        JsonNode resolved = engineWithCondition("UseProdTags", true).resolveNode(ifNode);
+
+        assertEquals("us-east-1", resolved.get(0).get("Value").asText());
     }
 }

@@ -4160,7 +4160,11 @@ public class CloudFormationResourceProvisioner {
             }
         }
 
-        List<String> functionResponseTypes = resolveStringList(props, "FunctionResponseTypes", engine);
+        // resolveStringListOrEmpty (not resolveStringList) because it resolves the whole property
+        // through resolveNode first, so a whole-property intrinsic like Fn::If or Fn::Split - or a
+        // Ref to a CommaDelimitedList parameter - is evaluated instead of silently rejected by a
+        // raw isArray() check on the unresolved node.
+        List<String> functionResponseTypes = resolveStringListOrEmpty(props, "FunctionResponseTypes", engine);
         if (!functionResponseTypes.isEmpty()) {
             req.put("FunctionResponseTypes", functionResponseTypes);
         }
