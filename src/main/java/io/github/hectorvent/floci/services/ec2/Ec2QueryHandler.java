@@ -59,6 +59,7 @@ public class Ec2QueryHandler {
             return switch (action) {
                 // Instances
                 case "RunInstances" -> handleRunInstances(params, region);
+                case "CreateFleet" -> handleCreateFleet(params, region);
                 case "DescribeInstances" -> handleDescribeInstances(params, region);
                 case "DescribeIamInstanceProfileAssociations" ->
                         handleDescribeIamInstanceProfileAssociations(params, region);
@@ -714,6 +715,291 @@ public class Ec2QueryHandler {
         }
         return service.resolveLaunchTemplateData(region, id, name, version);
     }
+
+    /**
+     * Handles the synchronous EC2 Fleet form used by Karpenter for node launches and
+     * authorization dry-runs. Floci does not model fleet requests as a separate long-lived
+     * resource: an instant fleet is represented by the instances it launches, which keeps
+     * DescribeInstances and termination behavior consistent with RunInstances.
+     *
+     * <p>The EC2 Query model calls this member {@code LaunchTemplateConfigs}, while the wire
+     * location name emitted by SDK serializers is {@code LaunchTemplateConfig.N}. Accept both
+     * spellings because callers in the ecosystem use both forms.</p>
+     */
+    private Response handleCreateFleet(MultivaluedMap<String, String> p, String region) {
+        String fleetType = firstNonBlank(p.getFirst("Type"), "instant");
+        if (!"instant".equals(fleetType)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Only instant fleets are supported for local EC2 launches.", 400);
+        }
+        String capacityType = firstNonBlank(
+                p.getFirst("TargetCapacitySpecification.DefaultTargetCapacityType"), "on-demand");
+        if (!Set.of("on-demand", "spot").contains(capacityType)) {
+            throw new AwsException("InvalidParameterValue",
+                    "DefaultTargetCapacityType must be on-demand or spot.", 400);
+        }
+
+        int targetCapacity = parseIntParam(p, "TargetCapacitySpecification.TotalTargetCapacity", 0);
+        if (targetCapacity <= 0) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter TargetCapacitySpecification.TotalTargetCapacity.", 400);
+        }
+
+        List<FleetLaunch> launches = parseFleetLaunches(p, region);
+        if (launches.isEmpty()) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter LaunchTemplateConfigs.", 400);
+        }
+
+        // Resolve and validate every launch template before honoring DryRun. AWS returns
+        // DryRunOperation only after it has established that the request could succeed.
+        for (FleetLaunch launch : launches) {
+            if (launch.imageId() == null || launch.imageId().isBlank()) {
+                throw new AwsException("MissingParameter",
+                        "Each fleet launch must specify an ImageId in the launch template or override.", 400);
+            }
+            if (launch.instanceType() == null || launch.instanceType().isBlank()) {
+                throw new AwsException("MissingParameter",
+                        "Each fleet launch must specify an InstanceType in the launch template or override.", 400);
+            }
+        }
+        checkDryRun(p);
+
+        List<FleetLaunchResult> results = new ArrayList<>(targetCapacity);
+        List<String> launchedInstanceIds = new ArrayList<>(targetCapacity);
+        try {
+            for (int i = 0; i < targetCapacity; i++) {
+                FleetLaunch launch = launches.get(i % launches.size());
+                Reservation reservation = service.runInstances(
+                        region,
+                        launch.imageId(),
+                        launch.instanceType(),
+                        1,
+                        1,
+                        launch.keyName(),
+                        launch.securityGroupIds(),
+                        launch.subnetId(),
+                        p.getFirst("ClientToken"),
+                        launch.instanceTags(),
+                        launch.userData(),
+                        launch.iamInstanceProfileArn(),
+                        null,
+                        null,
+                        0,
+                        launch.availabilityZone());
+                Instance instance = reservation.getInstances().get(0);
+                launchedInstanceIds.add(instance.getInstanceId());
+                results.add(new FleetLaunchResult(instance, launch));
+            }
+        } catch (RuntimeException e) {
+            if (!launchedInstanceIds.isEmpty()) {
+                LOG.warnv("CreateFleet failed after launching instances {0}; rolling them back: {1}",
+                        launchedInstanceIds, e.getMessage());
+                List<String> rollbackFailureInstanceIds = new ArrayList<>();
+                List<RuntimeException> rollbackFailures = new ArrayList<>();
+                for (String instanceId : launchedInstanceIds) {
+                    try {
+                        service.terminateInstances(region, List.of(instanceId));
+                    } catch (RuntimeException cleanupFailure) {
+                        rollbackFailureInstanceIds.add(instanceId);
+                        rollbackFailures.add(cleanupFailure);
+                        LOG.errorv(cleanupFailure, "CreateFleet rollback failed for instance {0}: {1}",
+                                instanceId, cleanupFailure.getMessage());
+                    }
+                }
+                if (!rollbackFailures.isEmpty()) {
+                    String rollbackMessage = "CreateFleet rollback incomplete for instance(s): "
+                            + String.join(", ", rollbackFailureInstanceIds);
+                    if (e instanceof AwsException awsFailure) {
+                        AwsException enrichedFailure = new AwsException(
+                                awsFailure.getErrorCode(),
+                                awsFailure.getMessage() + " " + rollbackMessage,
+                                awsFailure.getHttpStatus());
+                        enrichedFailure.addSuppressed(e);
+                        rollbackFailures.forEach(enrichedFailure::addSuppressed);
+                        throw enrichedFailure;
+                    }
+                    rollbackFailures.forEach(e::addSuppressed);
+                }
+            }
+            throw e;
+        }
+
+        XmlBuilder xml = new XmlBuilder()
+                .start("CreateFleetResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("fleetId", "fleet-" + UUID.randomUUID().toString().replace("-", ""))
+                .start("fleetInstanceSet");
+        // AWS groups instances that share a launch template and overrides into one fleet
+        // instance entry. Keep the first-seen order stable while collecting all instance IDs.
+        Map<FleetLaunchKey, List<FleetLaunchResult>> groupedResults = new LinkedHashMap<>();
+        for (FleetLaunchResult result : results) {
+            groupedResults.computeIfAbsent(FleetLaunchKey.from(result.launch()), ignored -> new ArrayList<>())
+                    .add(result);
+        }
+        for (List<FleetLaunchResult> group : groupedResults.values()) {
+            FleetLaunchResult first = group.getFirst();
+            Instance instance = first.instance();
+            FleetLaunch launch = first.launch();
+            xml.start("item")
+                    .start("instanceIds");
+            for (FleetLaunchResult result : group) {
+                xml.elem("item", result.instance().getInstanceId());
+            }
+            xml.end("instanceIds")
+                    .elem("instanceType", instance.getInstanceType())
+                    .elem("availabilityZone", instance.getPlacement() != null
+                            ? instance.getPlacement().getAvailabilityZone() : null)
+                    .elem("subnetId", instance.getSubnetId())
+                    .elem("lifecycle", capacityType)
+                    .start("launchTemplateAndOverrides")
+                    .start("launchTemplateSpecification")
+                    .elem("launchTemplateId", launch.launchTemplateId())
+                    .elem("launchTemplateName", launch.launchTemplateName())
+                    .elem("version", launch.launchTemplateVersion())
+                    .end("launchTemplateSpecification")
+                    .start("overrides")
+                    .elem("instanceType", launch.instanceType())
+                    .elem("imageId", launch.imageId())
+                    .elem("subnetId", launch.subnetId())
+                    .elem("availabilityZone", launch.availabilityZone())
+                    .end("overrides")
+                    .end("launchTemplateAndOverrides")
+                    .end("item");
+        }
+        xml.end("fleetInstanceSet")
+                .end("CreateFleetResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private List<FleetLaunch> parseFleetLaunches(MultivaluedMap<String, String> p, String region) {
+        List<FleetLaunch> launches = new ArrayList<>();
+        for (int i = 1; ; i++) {
+            String base = fleetConfigBase(p, i);
+            if (base == null) {
+                break;
+            }
+            String launchTemplateId = p.getFirst(base + ".LaunchTemplateSpecification.LaunchTemplateId");
+            String launchTemplateName = p.getFirst(base + ".LaunchTemplateSpecification.LaunchTemplateName");
+            String version = p.getFirst(base + ".LaunchTemplateSpecification.Version");
+            LaunchTemplateData template = service.resolveLaunchTemplateData(
+                    region, launchTemplateId, launchTemplateName, version);
+            List<Tag> fleetInstanceTags = parseTagsForResource(p, "instance");
+
+            boolean hasOverride = false;
+            for (int j = 1; ; j++) {
+                String overrideBase = base + ".Overrides." + j;
+                String instanceType = p.getFirst(overrideBase + ".InstanceType");
+                String imageId = p.getFirst(overrideBase + ".ImageId");
+                String subnetId = p.getFirst(overrideBase + ".SubnetId");
+                String availabilityZone = p.getFirst(overrideBase + ".AvailabilityZone");
+                if (instanceType == null && imageId == null && subnetId == null && availabilityZone == null) {
+                    break;
+                }
+                hasOverride = true;
+                launches.add(fleetLaunch(region, template, launchTemplateId, launchTemplateName, version,
+                        instanceType, imageId, subnetId, availabilityZone, fleetInstanceTags));
+            }
+            if (!hasOverride) {
+                launches.add(fleetLaunch(region, template, launchTemplateId, launchTemplateName, version,
+                        null, null, null, null, fleetInstanceTags));
+            }
+        }
+        return launches;
+    }
+
+    private FleetLaunch fleetLaunch(String region, LaunchTemplateData template, String launchTemplateId,
+                                    String launchTemplateName, String version,
+                                    String overrideInstanceType, String overrideImageId,
+                                    String overrideSubnetId, String overrideAvailabilityZone,
+                                    List<Tag> fleetInstanceTags) {
+        Map<String, Tag> tags = new LinkedHashMap<>();
+        for (Tag tag : template.getInstanceTags()) {
+            tags.put(tag.getKey(), tag);
+        }
+        for (Tag tag : fleetInstanceTags) {
+            tags.put(tag.getKey(), tag);
+        }
+        String templateSubnetId = template.getNetworkInterfaces().stream()
+                .map(networkInterface -> networkInterface.getSubnetId())
+                .filter(Objects::nonNull)
+                .filter(value -> !value.isBlank())
+                .findFirst()
+                .orElse(null);
+        String subnetId = firstNonBlank(overrideSubnetId, templateSubnetId);
+        String templateAvailabilityZone = template.getPlacement() != null
+                ? template.getPlacement().getAvailabilityZone() : null;
+        String availabilityZone = resolveFleetAvailabilityZone(
+                region, templateSubnetId, templateAvailabilityZone, overrideSubnetId, overrideAvailabilityZone);
+        return new FleetLaunch(
+                launchTemplateId,
+                launchTemplateName,
+                version,
+                firstNonBlank(overrideInstanceType, template.getInstanceType()),
+                firstNonBlank(overrideImageId, template.getImageId()),
+                subnetId,
+                availabilityZone,
+                template.getKeyName(),
+                template.getUserData(),
+                service.iamInstanceProfileArn(template),
+                template.effectiveSecurityGroupIds(),
+                new ArrayList<>(tags.values()));
+    }
+
+    /**
+     * Resolves the placement represented by one CreateFleet launch override.
+     *
+     * <p>A subnet supplied by an override replaces the subnet inherited from the launch template.
+     * Its availability zone therefore also replaces a template placement zone when the override
+     * does not carry an explicit zone. Passing the template zone through in that case creates a
+     * valid subnet-only AWS override that is incorrectly rejected as a subnet/AZ mismatch. Resolve
+     * the subnet here so both the launch request and the response describe the same placement.</p>
+     */
+    private String resolveFleetAvailabilityZone(String region, String templateSubnetId,
+                                                String templateAvailabilityZone, String overrideSubnetId,
+                                                String overrideAvailabilityZone) {
+        if (isSet(overrideAvailabilityZone)) {
+            return overrideAvailabilityZone;
+        }
+        if (isSet(overrideSubnetId)) {
+            return service.requireSubnet(region, overrideSubnetId).getAvailabilityZone();
+        }
+        if (isSet(templateAvailabilityZone)) {
+            return templateAvailabilityZone;
+        }
+        if (isSet(templateSubnetId)) {
+            return service.requireSubnet(region, templateSubnetId).getAvailabilityZone();
+        }
+        return null;
+    }
+
+    private String fleetConfigBase(MultivaluedMap<String, String> p, int index) {
+        String singular = "LaunchTemplateConfig." + index;
+        String plural = "LaunchTemplateConfigs." + index;
+        if (anyParamStartsWith(p, singular + ".")) {
+            return singular;
+        }
+        if (anyParamStartsWith(p, plural + ".")) {
+            return plural;
+        }
+        return null;
+    }
+
+    private record FleetLaunch(String launchTemplateId, String launchTemplateName, String launchTemplateVersion,
+                               String instanceType, String imageId, String subnetId, String availabilityZone,
+                               String keyName, String userData, String iamInstanceProfileArn,
+                               List<String> securityGroupIds, List<Tag> instanceTags) {}
+
+    private record FleetLaunchKey(String launchTemplateId, String launchTemplateName, String launchTemplateVersion,
+                                  String instanceType, String imageId, String subnetId, String availabilityZone) {
+        private static FleetLaunchKey from(FleetLaunch launch) {
+            return new FleetLaunchKey(launch.launchTemplateId(), launch.launchTemplateName(),
+                    launch.launchTemplateVersion(), launch.instanceType(), launch.imageId(), launch.subnetId(),
+                    launch.availabilityZone());
+        }
+    }
+
+    private record FleetLaunchResult(Instance instance, FleetLaunch launch) {}
 
     private static String firstNonBlank(String first, String fallback) {
         return first != null && !first.isBlank() ? first : fallback;
