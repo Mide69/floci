@@ -302,8 +302,9 @@ public class AwsQueryController {
             case "elasticache" -> elastiCacheQueryHandler.handle(action, formParams, region);
             case "rds" -> {
                 // Neptune signs requests with "rds" credential scope (same wire protocol).
-                // Route to Neptune when Engine=neptune (create ops) or when the cluster/instance
-                // already exists in Neptune storage (describe/modify/delete ops).
+                // Route to Neptune when Engine=neptune (create ops), when the cluster/instance
+                // already exists in Neptune storage (describe/modify/delete ops), or when a
+                // tagging ResourceName is a Neptune ARN.
                 String engine = formParams.getFirst("Engine");
                 String clusterId = formParams.getFirst("DBClusterIdentifier");
                 String instanceId = formParams.getFirst("DBInstanceIdentifier");
@@ -315,7 +316,8 @@ public class AwsQueryController {
 
                 if ("neptune".equalsIgnoreCase(engine)
                         || neptuneService.hasCluster(clusterId)
-                        || neptuneService.hasInstance(instanceId)) {
+                        || neptuneService.hasInstance(instanceId)
+                        || neptuneService.hasResourceWithArn(formParams.getFirst("ResourceName"))) {
                     yield neptuneQueryHandler.handle(action, formParams);
                 }
 
@@ -518,6 +520,7 @@ public class AwsQueryController {
             "CreateDBSubnetGroup", "DescribeDBSubnetGroups", "ModifyDBSubnetGroup", "DeleteDBSubnetGroup",
             "AddTagsToResource", "ListTagsForResource", "RemoveTagsFromResource",
             "CreateDBCluster", "DescribeDBClusters", "DeleteDBCluster", "ModifyDBCluster",
+            "AddRoleToDBCluster", "RemoveRoleFromDBCluster",
             "DescribeGlobalClusters",
             "CreateDBParameterGroup", "DescribeDBParameterGroups",
             "DeleteDBParameterGroup", "ModifyDBParameterGroup", "DescribeDBParameters",
