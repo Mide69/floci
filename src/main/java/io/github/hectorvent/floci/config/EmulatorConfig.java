@@ -51,12 +51,6 @@ public interface EmulatorConfig {
     @WithDefault("000000000000")
     String defaultAccountId();
 
-    @WithDefault("2048")
-    int maxRequestSize();
-
-    @WithDefault("public.ecr.aws")
-    String ecrBaseUri();
-
     /**
      * Path to a shared mock-response configuration file used by the fixed-stub AI services
      * (Textract, Comprehend, Rekognition) to return a caller-configured response instead of
@@ -86,6 +80,17 @@ public interface EmulatorConfig {
     ProtocolsConfig protocols();
 
     interface ProtocolsConfig {
+        /**
+         * Maximum HTTP request body size, in megabytes. Feeds
+         * {@code quarkus.http.limits.max-body-size} in {@code application.yml}.
+         *
+         * <p>Moved here from the {@code floci} root in 2.x. The former flat key
+         * {@code floci.max-request-size} (env {@code FLOCI_MAX_REQUEST_SIZE}) still works
+         * (see {@link FlociConfigRelocationsInterceptor}), but is deprecated.
+         */
+        @WithDefault("2048")
+        int maxRequestSize();
+
         /**
          * When enabled, requests carrying an RPC protocol signal that no
          * supported wire protocol claims are rejected per the Smithy
@@ -584,7 +589,7 @@ public interface EmulatorConfig {
         @WithDefault("5000")
         long flushIntervalMs();
     }
-  
+
     interface CodeDeployStorageConfig {
         Optional<String> mode();
 
@@ -709,6 +714,7 @@ public interface EmulatorConfig {
         RamServiceConfig ram();
         ControlTowerServiceConfig controltower();
         ConnectServiceConfig connect();
+        CognitoIdentityServiceConfig cognitoidentity();
 
         ApsServiceConfig aps();
 
@@ -718,6 +724,11 @@ public interface EmulatorConfig {
     }
 
     interface ConnectServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface CognitoIdentityServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -812,7 +823,7 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
     }
-  
+
     interface EfsServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -1415,6 +1426,20 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean allowStubLambdaCode();
+
+        /**
+         * Whether a resource whose type Floci has no provisioner for may be stubbed: a synthetic
+         * physical id, an {@code arn:aws:stub:::} ARN attribute and {@code CREATE_COMPLETE}.
+         *
+         * <p>Defaults to {@code true}, because Floci implements a fraction of the CloudFormation
+         * registry and failing every other type would reject templates that are valid to AWS. The
+         * stub is reported at warn and carries a resource status reason saying nothing was created,
+         * so a {@code CREATE_COMPLETE} stack can still be read as one where some resources exist
+         * only on paper. Set to {@code false} to fail such a resource instead, which rolls the
+         * stack back, for a pipeline that must not pass over a resource it never got.
+         */
+        @WithDefault("true")
+        boolean allowStubUnsupportedResourceTypes();
     }
 
     interface AcmServiceConfig {
@@ -1785,12 +1810,31 @@ public interface EmulatorConfig {
         @WithDefault("hostname")
         String uriStyle();
 
+        /**
+         * When true, an AWS-shaped ECR image URI that names an image already present on the Docker
+         * daemon is used as-is instead of being rewritten to Floci's loopback registry.
+         */
+        @WithDefault("true")
+        boolean preferLocalImages();
+
         Optional<String> dockerNetwork();
     }
 
     interface LambdaServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * Registry host (optionally with a path prefix) that Lambda runtime images are pulled
+         * from, e.g. {@code public.ecr.aws} produces {@code public.ecr.aws/lambda/python:3.12}.
+         * Point it at a private mirror to avoid depending on ECR Public.
+         *
+         * <p>Moved here from the {@code floci} root in 2.x. The former flat key
+         * {@code floci.ecr-base-uri} (env {@code FLOCI_ECR_BASE_URI}) still works
+         * (see {@link FlociConfigRelocationsInterceptor}), but is deprecated.
+         */
+        @WithDefault("public.ecr.aws")
+        String ecrBaseUri();
 
         @WithDefault("128")
         int defaultMemoryMb();
@@ -1829,6 +1873,16 @@ public interface EmulatorConfig {
 
         @WithDefault("false")
         boolean ephemeral();
+
+        /**
+         * When true, Docker Lambda containers use the platform declared by the function's
+         * Architectures value. Disabled by default because foreign-platform containers require
+         * host support such as binfmt_misc or QEMU.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_HONOUR_ARCHITECTURES
+         */
+        @WithDefault("false")
+        boolean honourArchitectures();
 
         @WithDefault("300")
         int containerIdleTimeoutSeconds();

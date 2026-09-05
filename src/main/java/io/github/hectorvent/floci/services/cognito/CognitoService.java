@@ -5,6 +5,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import io.github.hectorvent.floci.services.cognito.model.EmailMfaSettings;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
@@ -16,6 +17,9 @@ import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.AcmService;
+import io.github.hectorvent.floci.services.acm.model.Certificate;
+import io.github.hectorvent.floci.services.acm.model.CertificateStatus;
 import io.github.hectorvent.floci.services.cognito.model.CognitoGroup;
 import io.github.hectorvent.floci.services.cognito.model.CognitoUser;
 import io.github.hectorvent.floci.services.cognito.model.IdentityProvider;
@@ -66,6 +70,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -120,6 +125,7 @@ public class CognitoService implements ResourceProvider {
     private final String baseUrl;
     private final RegionResolver regionResolver;
     private final LambdaService lambdaService;
+    private final AcmService acmService;
     private final VerificationCodeService verificationCodeService;
     private final CognitoMessageDispatcher messageDispatcher;
 
@@ -128,8 +134,8 @@ public class CognitoService implements ResourceProvider {
 
     @Inject
     public CognitoService(StorageFactory storageFactory, EmulatorConfig emulatorConfig,
-            RegionResolver regionResolver, LambdaService lambdaService, SesService sesService,
-            SnsService snsService, Clock clock) {
+            RegionResolver regionResolver, LambdaService lambdaService, AcmService acmService,
+            SesService sesService, SnsService snsService, Clock clock) {
         this(
                 storageFactory.create("cognito", "cognito-pools.json",
                         new TypeReference<Map<String, UserPool>>() {}),
@@ -150,6 +156,7 @@ public class CognitoService implements ResourceProvider {
                 trimTrailingSlash(emulatorConfig.effectiveBaseUrl()),
                 regionResolver,
                 lambdaService,
+                acmService,
                 new VerificationCodeService(storageFactory, clock),
                 new CognitoMessageDispatcher(sesService, snsService)
         );
@@ -163,10 +170,11 @@ public class CognitoService implements ResourceProvider {
                    StorageBackend<String, RevokedTokenInfo> revokedTokenStore,
                    String baseUrl,
                    RegionResolver regionResolver,
-                   LambdaService lambdaService) {
+                   LambdaService lambdaService,
+                   AcmService acmService) {
         this(poolStore, clientStore, resourceServerStore, new InMemoryStorage<>(),
                 new InMemoryStorage<>(), userStore, groupStore, revokedTokenStore, baseUrl,
-                regionResolver, lambdaService, null, null);
+                regionResolver, lambdaService, acmService, null, null);
     }
 
     CognitoService(StorageBackend<String, UserPool> poolStore,
@@ -178,7 +186,7 @@ public class CognitoService implements ResourceProvider {
             StorageBackend<String, CognitoGroup> groupStore,
             StorageBackend<String, RevokedTokenInfo> revokedTokenStore,
             String baseUrl,
-            RegionResolver regionResolver, LambdaService lambdaService,
+            RegionResolver regionResolver, LambdaService lambdaService, AcmService acmService,
             VerificationCodeService verificationCodeService,
             CognitoMessageDispatcher messageDispatcher) {
         this.poolStore = poolStore;
@@ -192,6 +200,7 @@ public class CognitoService implements ResourceProvider {
         this.baseUrl = baseUrl;
         this.regionResolver = regionResolver;
         this.lambdaService = lambdaService;
+        this.acmService = acmService;
         this.verificationCodeService = verificationCodeService;
         this.messageDispatcher = messageDispatcher;
         this.authFlowHandler = new CognitoAuthFlowHandler(this, lambdaService, regionResolver);
@@ -358,12 +367,69 @@ public class CognitoService implements ResourceProvider {
 
     public UserPool describeUserPool(String id) {
         UserPool pool = poolStore.get(id)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "User pool not found", 400));
+                .orElseThrow(() -> userPoolNotFound(id));
         boolean generatedKeys = ensureJwtSigningKeys(pool);
         boolean generatedSecret = ensureRefreshTokenSecret(pool);
         if (generatedKeys || generatedSecret) {
             poolStore.put(id, pool);
         }
+        return pool;
+    }
+
+    /**
+     * SetUserPoolMfaConfig. Stores the MFA mode and the software-token setting, which is
+     * what GetUserPoolMfaConfig reports back and what the Terraform provider reads to
+     * detect drift on mfa_configuration / software_token_mfa_configuration.
+     *
+     * <p>SMS, email and WebAuthn MFA are accepted and not stored: Floci has no path to
+     * deliver an SMS or email factor, so retaining the config would claim a capability
+     * that does not exist.
+     */
+    /**
+     * @param otherFactorConfigured whether EmailMfaConfiguration or SmsMfaConfiguration was
+     *     present in the request. Both count towards the factor rules below even though
+     *     Floci does not deliver either challenge; WebAuthnConfiguration does not, measured
+     *     against the live service, which accepts it alongside OFF and does not accept it
+     *     as the sole factor for ON or OPTIONAL.
+     */
+    public UserPool setUserPoolMfaConfig(String id, String mfaConfiguration,
+                                         Boolean softwareTokenMfaEnabled,
+                                         boolean otherFactorConfigured) {
+        UserPool pool = describeUserPool(id);
+        // An absent MfaConfiguration means OFF, not "leave the current mode alone":
+        // measured against the live service, which resets a pool that was OPTIONAL back
+        // to OFF when the member is omitted.
+        String mode = mfaConfiguration != null ? mfaConfiguration : "OFF";
+        if (!List.of("OPTIONAL", "OFF", "ON").contains(mode)) {
+            throw new AwsException("InvalidParameterException",
+                    "1 validation error detected: Value '" + mode
+                            + "' at 'mfaConfiguration' failed to satisfy constraint: "
+                            + "Member must satisfy enum value set: [OPTIONAL, OFF, ON]", 400);
+        }
+        // Presence, not value: the live service rejects OFF alongside
+        // SoftwareTokenMfaConfiguration{Enabled:false} just as it does Enabled:true, and
+        // conversely accepts ON alongside Enabled:false, so the member being there is what
+        // counts, despite the "must be enabled" wording of the second message.
+        boolean anyFactorConfigured = softwareTokenMfaEnabled != null || otherFactorConfigured;
+        if ("OFF".equals(mode) && anyFactorConfigured) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid MFA configuration given, can't turn off MFA and configure an "
+                            + "MFA together.", 400);
+        }
+        if (!"OFF".equals(mode) && !anyFactorConfigured) {
+            throw new AwsException("InvalidParameterException",
+                    "Invalid MFA Configuration given. SMS MFA, Email MFA, or Software Token "
+                            + "MFA must be enabled.", 400);
+        }
+        pool.setMfaConfiguration(mode);
+        if ("OFF".equals(mode)) {
+            // Turning MFA off drops the factor configuration with it: the live service
+            // answers OFF alone afterwards, with no SoftwareTokenMfaConfiguration member.
+            pool.setSoftwareTokenMfaEnabled(null);
+        } else if (softwareTokenMfaEnabled != null) {
+            pool.setSoftwareTokenMfaEnabled(softwareTokenMfaEnabled);
+        }
+        poolStore.put(id, pool);
         return pool;
     }
 
@@ -593,6 +659,7 @@ public class CognitoService implements ResourceProvider {
     }
 
     public List<UserPoolClient> listUserPoolClients(String userPoolId) {
+        describeUserPool(userPoolId);
         return clientStore.scan(k -> clientStore.get(k).map(c -> c.getUserPoolId().equals(userPoolId)).orElse(false));
     }
 
@@ -1014,6 +1081,10 @@ public class CognitoService implements ResourceProvider {
 
     // ──────────────────────────── User Pool Domains ────────────────────────────
 
+    private static final String CERTIFICATE_REGION = "us-east-1";
+    private static final String CERTIFICATE_NOT_USABLE = "The specified SSL certificate doesn't exist, "
+            + "isn't in us-east-1 region, isn't valid, or doesn't include a valid certificate chain.";
+
     /**
      * Creates either an Amazon Cognito prefix domain ({@code customDomainConfig == null})
      * or a custom domain fronted by an ACM certificate. Domain names are globally unique
@@ -1045,12 +1116,16 @@ public class CognitoService implements ResourceProvider {
                 throw new AwsException("InvalidParameterException",
                         "CertificateArn is required in CustomDomainConfig", 400);
             }
+            requireUsableCertificate(certificateArn);
             userPoolDomain.setCertificateArn(certificateArn);
             Object securityPolicy = customDomainConfig.get("SecurityPolicy");
             userPoolDomain.setSecurityPolicy(securityPolicy != null ? securityPolicy.toString() : "TLS_V1_2_2021");
             userPoolDomain.setCloudFrontDistribution(generateCloudFrontDomain());
         }
 
+        if (userPoolDomain.isCustomDomain()) {
+            registerCertificateUse(userPoolDomain.getCertificateArn(), userPoolDomain);
+        }
         domainStore.put(domain, userPoolDomain);
         LOG.infov("Created User Pool Domain: {0} for pool {1}", domain, userPoolId);
         return userPoolDomain;
@@ -1064,13 +1139,124 @@ public class CognitoService implements ResourceProvider {
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Domain does not exist", 404));
     }
 
+    /**
+     * Changes a domain in place: the certificate behind a custom domain ({@code CustomDomainConfig})
+     * or the managed login version. As on AWS the domain keeps its CloudFront distribution, so a
+     * DNS alias pointing at it stays valid. A setting the request omits is left unchanged.
+     */
+    public UserPoolDomain updateUserPoolDomain(String domain, String userPoolId,
+            Map<String, Object> customDomainConfig, Integer managedLoginVersion) {
+        describeUserPool(userPoolId);
+        UserPoolDomain userPoolDomain = describeUserPoolDomain(domain);
+        if (!userPoolDomain.getUserPoolId().equals(userPoolId)) {
+            throw new AwsException("ResourceNotFoundException", "Domain does not exist", 404);
+        }
+        String previousCertificateArn = userPoolDomain.getCertificateArn();
+        String certificateArn = previousCertificateArn;
+        if (customDomainConfig != null) {
+            if (!userPoolDomain.isCustomDomain()) {
+                throw new AwsException("InvalidParameterException",
+                        "CustomDomainConfig cannot be set on an Amazon Cognito prefix domain", 400);
+            }
+            certificateArn = (String) customDomainConfig.get("CertificateArn");
+            if (certificateArn == null || certificateArn.isBlank()) {
+                throw new AwsException("InvalidParameterException",
+                        "CertificateArn is required in CustomDomainConfig", 400);
+            }
+        }
+        // A new certificate is checked and registered before anything changes, so a failure leaves
+        // the domain on its current certificate.
+        boolean certificateChanged = !Objects.equals(certificateArn, previousCertificateArn);
+        if (certificateChanged) {
+            requireUsableCertificate(certificateArn);
+            registerCertificateUse(certificateArn, userPoolDomain);
+        }
+        if (customDomainConfig != null) {
+            userPoolDomain.setCertificateArn(certificateArn);
+            Object securityPolicy = customDomainConfig.get("SecurityPolicy");
+            if (securityPolicy != null) {
+                userPoolDomain.setSecurityPolicy(securityPolicy.toString());
+            }
+        }
+        if (managedLoginVersion != null) {
+            userPoolDomain.setManagedLoginVersion(managedLoginVersion);
+        }
+        userPoolDomain.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+        domainStore.put(domain, userPoolDomain);
+        if (certificateChanged) {
+            acmService.removeInUseBy(previousCertificateArn,
+                    cloudFrontDistributionArn(userPoolDomain), CERTIFICATE_REGION);
+        }
+        LOG.infov("Updated User Pool Domain: {0} for pool {1}", domain, userPoolId);
+        return userPoolDomain;
+    }
+
     public void deleteUserPoolDomain(String domain, String userPoolId) {
         UserPoolDomain userPoolDomain = describeUserPoolDomain(domain);
         if (!userPoolDomain.getUserPoolId().equals(userPoolId)) {
             throw new AwsException("ResourceNotFoundException", "Domain does not exist", 404);
         }
         domainStore.delete(domain);
+        if (userPoolDomain.isCustomDomain()) {
+            acmService.removeInUseBy(userPoolDomain.getCertificateArn(),
+                    cloudFrontDistributionArn(userPoolDomain), CERTIFICATE_REGION);
+        }
         LOG.infov("Deleted User Pool Domain: {0} for pool {1}", domain, userPoolId);
+    }
+
+    /**
+     * Registers the domain on its certificate before the domain is stored or changed, so a
+     * certificate that disappears between the check and the registration leaves nothing behind.
+     */
+    private void registerCertificateUse(String certificateArn, UserPoolDomain userPoolDomain) {
+        try {
+            acmService.addInUseBy(certificateArn, cloudFrontDistributionArn(userPoolDomain), CERTIFICATE_REGION);
+        } catch (AwsException e) {
+            if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+    }
+
+    /**
+     * AWS accepts only an issued ACM certificate from us-east-1 behind a custom domain, and answers
+     * anything else with this one message.
+     */
+    private void requireUsableCertificate(String certificateArn) {
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(certificateArn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+        if (!"acm".equals(arn.service()) || !CERTIFICATE_REGION.equals(arn.region())
+                || !arn.resource().startsWith("certificate/")) {
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+        Certificate certificate;
+        try {
+            certificate = acmService.describeCertificate(certificateArn, CERTIFICATE_REGION);
+        } catch (AwsException e) {
+            if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+        if (certificate.getStatus() != CertificateStatus.ISSUED) {
+            throw new AwsException("InvalidParameterException", CERTIFICATE_NOT_USABLE, 400);
+        }
+    }
+
+    /**
+     * What a custom domain registers on its certificate: the CloudFront distribution that serves
+     * it, which is what ACM lists on AWS. Floci has no distribution object, so the id is the label
+     * of the generated CloudFront name.
+     */
+    private static String cloudFrontDistributionArn(UserPoolDomain userPoolDomain) {
+        String name = userPoolDomain.getCloudFrontDistribution();
+        String id = name.substring(0, name.indexOf('.')).toUpperCase(Locale.ROOT);
+        return "arn:aws:cloudfront::" + userPoolDomain.getAwsAccountId() + ":distribution/" + id;
     }
 
     private String generateCloudFrontDomain() {
@@ -1415,7 +1601,7 @@ public class CognitoService implements ResourceProvider {
 
     public CognitoUser adminGetUser(String userPoolId, String username) {
         UserPool pool = poolStore.get(userPoolId).orElseThrow(
-                () -> new AwsException("ResourceNotFoundException", "User pool not found", 400));
+                () -> userPoolNotFound(userPoolId));
         LinkedHashMap<String, CognitoUser> matches = new LinkedHashMap<>();
         userStore.get(userKey(userPoolId, username))
                 .ifPresent(u -> matches.put(u.getUsername(), u));
@@ -1603,6 +1789,7 @@ public class CognitoService implements ResourceProvider {
     }
 
     public List<CognitoUser> listUsers(String userPoolId, String filter) {
+        describeUserPool(userPoolId);
         String prefix = userPoolId + "::";
         List<CognitoUser> all = userStore.scan(k -> k.startsWith(prefix));
         if (filter == null || filter.isBlank()) {
@@ -2033,9 +2220,9 @@ public class CognitoService implements ResourceProvider {
         UserPoolClient client = clientStore.get(clientId)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Client not found",
                         400));
-        UserPool pool = poolStore.get(client.getUserPoolId())
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                        "User pool not found", 400));
+        String userPoolId = client.getUserPoolId();
+        UserPool pool = poolStore.get(userPoolId)
+                .orElseThrow(() -> userPoolNotFound(userPoolId));
         CognitoUser user = adminGetUser(client.getUserPoolId(), username);
         if (verificationCodeService != null && isSignUpConfirmationEnabled(pool)) {
             try {
@@ -2396,6 +2583,11 @@ public class CognitoService implements ResourceProvider {
     }
 
     // ──────────────────────────── Private helpers ────────────────────────────
+
+    private static AwsException userPoolNotFound(String userPoolId) {
+        return new AwsException("ResourceNotFoundException",
+                "User pool " + userPoolId + " does not exist.", 400);
+    }
 
     UserPoolClient findClientById(String clientId) {
         return clientStore.get(clientId)
@@ -3774,7 +3966,98 @@ public class CognitoService implements ResourceProvider {
         }
         return value;
     }
+    public void adminSetUserMFAPreference(
+            String userPoolId,
+            String username,
+            Boolean emailEnabled,
+            Boolean emailPreferred) {
 
+        CognitoUser user = adminGetUser(userPoolId, username);
+
+        updateEmailMfaPreference(user, emailEnabled, emailPreferred);
+
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+
+        userStore.put(userKey(userPoolId, user.getUsername()), user);
+    }
+
+    public void setUserMFAPreference(
+            String accessToken,
+            Boolean emailEnabled,
+            Boolean emailPreferred) {
+
+        String username = extractUsernameFromToken(accessToken);
+        String poolId = extractPoolIdFromToken(accessToken);
+        String jti = extractJtiFromToken(accessToken);
+
+        if (username == null || poolId == null || jti == null) {
+            throw new AwsException(
+                    "NotAuthorizedException",
+                    "Invalid access token",
+                    400
+            );
+        }
+
+        validateTokenNotRevoked(jti, poolId, "access");
+        validateOriginJtiNotRevoked(accessToken, poolId);
+
+        Long iat = extractIatFromToken(accessToken);
+
+        validateUserNotGloballySignedOut(
+                username,
+                poolId,
+                "access",
+                iat != null ? iat : 0L
+        );
+
+        CognitoUser user = adminGetUser(poolId, username);
+
+        updateEmailMfaPreference(user, emailEnabled, emailPreferred);
+
+        user.setLastModifiedDate(System.currentTimeMillis() / 1000L);
+
+        userStore.put(userKey(poolId, user.getUsername()), user);
+    }
+
+    private void updateEmailMfaPreference(
+            CognitoUser user,
+            Boolean enabled,
+            Boolean preferredMfa) {
+
+        if (enabled == null && preferredMfa == null) {
+            return;
+        }
+
+        EmailMfaSettings current = user.getEmailMfaSettings();
+
+        boolean newEnabled = enabled != null
+                ? enabled
+                : current != null && current.isEnabled();
+
+        boolean newPreferredMfa = preferredMfa != null
+                ? preferredMfa
+                : current != null && current.isPreferredMfa();
+        if (!newEnabled && Boolean.TRUE.equals(preferredMfa)) {
+            throw new AwsException(
+                    "InvalidParameterException",
+                    "Preferred MFA setting cannot be enabled when the MFA method is disabled.",
+                    400
+            );
+        }
+
+        if (!newEnabled) {
+            newPreferredMfa = false;
+        }
+
+        EmailMfaSettings settings = current != null
+                ? current
+                : new EmailMfaSettings();
+
+        settings.setEnabled(newEnabled);
+        settings.setPreferredMfa(newPreferredMfa);
+
+        user.setEmailMfaSettings(settings);
+    }
     private record DeliveryTarget(String attributeName, String deliveryMedium, String destination) {
     }
 }
