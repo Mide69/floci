@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Provision
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2SecurityGroupRuleCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.eventbridge.EventBridgeService;
 import io.github.hectorvent.floci.services.eventbridge.model.BatchParameters;
@@ -140,7 +141,7 @@ public class CloudFormationResourceProvisioner {
     private static final String LAMBDA_NAME_MODE_ATTR = "FlociLambdaFunctionNameMode";
     private static final String LAMBDA_PACKAGE_TYPE_ATTR = "FlociLambdaPackageType";
     static final String UPDATE_ROLLBACK_RESTORED_ATTR = CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR;
-    static final String UPDATE_ROLLBACK_FAILURE_ATTR = "__FlociUpdateRollbackFailure";
+    static final String UPDATE_ROLLBACK_FAILURE_ATTR = CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR;
     private static final String INLINE_CLEANUP_POLICY_NAME_ATTR = "__FlociInlineCleanupPolicyName";
     private static final String INLINE_CLEANUP_ROLE_TARGETS_ATTR = "__FlociInlineCleanupRoleTargets";
     private static final String INLINE_CLEANUP_USER_TARGETS_ATTR = "__FlociInlineCleanupUserTargets";
@@ -1175,16 +1176,12 @@ public class CloudFormationResourceProvisioner {
     }
 
     private List<String> resolveStringList(JsonNode props, String field, CloudFormationTemplateEngine engine) {
-        List<String> values = new ArrayList<>();
-        if (props != null && props.has(field) && props.get(field).isArray()) {
-            for (JsonNode element : props.get(field)) {
-                String resolved = engine.resolve(element);
-                if (resolved != null && !resolved.isBlank()) {
-                    values.add(resolved);
-                }
-            }
+        if (props == null || !props.has(field)) {
+            return new ArrayList<>();
         }
-        return values;
+        // engine.resolveStringList accepts both a literal array and a list-valued intrinsic
+        // (Fn::Split / Fn::GetAZs / Fn::Cidr) and drops blank entries (issue #2937).
+        return new ArrayList<>(engine.resolveStringList(props.get(field)));
     }
 
     private String blankToNull(String value) {
@@ -1299,12 +1296,12 @@ public class CloudFormationResourceProvisioner {
         }
         String description = firstNonBlank(resolveOptional(props, "DBSubnetGroupDescription", engine),
                 "Managed by CloudFormation");
-        List<String> subnetIds = new ArrayList<>();
-        if (props != null && props.has("SubnetIds") && props.get("SubnetIds").isArray()) {
-            for (JsonNode subnet : props.get("SubnetIds")) {
-                subnetIds.add(engine.resolve(subnet));
-            }
-        }
+        // SubnetIds may be a literal array, or a list-valued intrinsic — e.g. CDK's
+        // Fn::Split over a cross-stack Fn::ImportValue when the source VPC exports its
+        // subnet ids as one comma-joined value (issue #2937).
+        List<String> subnetIds = props != null && props.has("SubnetIds")
+                ? engine.resolveStringList(props.get("SubnetIds"))
+                : new ArrayList<>();
 
         // On UpdateStack, provision() is re-invoked for every resource regardless of whether its
         // properties actually changed, so a same-named group already on file must be reconciled in
@@ -4566,10 +4563,23 @@ public class CloudFormationResourceProvisioner {
         }
     }
 
+    /**
+     * One attempt at deleting what this update's replacement displaced. A resource type with an
+     * extracted provisioner owns its own cleanup; only the types still living in this class fall
+     * through to the Step Functions arm below.
+     */
     UpdateCleanupResult completeUpdate(StackResource resource) {
+        Optional<CfnResourceProvisioner> owner =
+                resourceRegistry.forType(resource.getResourceType());
+        if (owner.isPresent()) {
+            UpdateCleanupResult ownResult = owner.get().completeUpdate(resource);
+            if (ownResult.applicable()) {
+                return ownResult;
+            }
+        }
         String rawSnapshot = resource.getAttributes().get(SFN_UPDATE_SNAPSHOT_ATTR);
         if (rawSnapshot == null) {
-            return new UpdateCleanupResult(false, true, null, 0, null);
+            return UpdateCleanupResult.notApplicable();
         }
         try {
             JsonNode snapshot = objectMapper.readTree(rawSnapshot);
@@ -4619,7 +4629,20 @@ public class CloudFormationResourceProvisioner {
         }
     }
 
+    /**
+     * The physical id this update displaced, announced as DELETE_IN_PROGRESS before the stack
+     * update closes. An extracted provisioner answers for its own types; the rest fall through to
+     * the Step Functions arm.
+     */
     String updateCleanupPhysicalId(StackResource resource) {
+        Optional<CfnResourceProvisioner> owner =
+                resourceRegistry.forType(resource.getResourceType());
+        if (owner.isPresent()) {
+            String ownCleanupPhysicalId = owner.get().updateCleanupPhysicalId(resource);
+            if (ownCleanupPhysicalId != null) {
+                return ownCleanupPhysicalId;
+            }
+        }
         if ("Retain".equals(resource.getUpdateReplacePolicy())) {
             return null;
         }
@@ -4640,7 +4663,17 @@ public class CloudFormationResourceProvisioner {
         }
     }
 
+    /**
+     * Whether this update replaced the resource's physical entity, so the stack has cleanup
+     * pending. An extracted provisioner answers for its own types; the rest fall through to the
+     * Step Functions arm.
+     */
     boolean hasReplacementUpdate(StackResource resource) {
+        Optional<CfnResourceProvisioner> owner =
+                resourceRegistry.forType(resource.getResourceType());
+        if (owner.isPresent() && owner.get().hasReplacementUpdate(resource)) {
+            return true;
+        }
         String rawSnapshot = resource.getAttributes().get(SFN_UPDATE_SNAPSHOT_ATTR);
         if (rawSnapshot == null) {
             return false;
@@ -4654,11 +4687,24 @@ public class CloudFormationResourceProvisioner {
         }
     }
 
+    /**
+     * Drops the cleanup bookkeeping this update left on the resource. An extracted provisioner
+     * drops its own; the Step Functions snapshot below is dropped for the types still living here.
+     */
     void clearUpdate(StackResource resource) {
+        resourceRegistry.forType(resource.getResourceType())
+                .ifPresent(owner -> owner.clearUpdate(resource));
         resource.getAttributes().remove(SFN_UPDATE_SNAPSHOT_ATTR);
     }
 
     boolean rollbackUpdate(StackResource resource) {
+        // A resource type with an extracted provisioner owns its own restore; only the types still
+        // living in this class fall through to the Step Functions arm below.
+        Optional<CfnResourceProvisioner> owner =
+                resourceRegistry.forType(resource.getResourceType());
+        if (owner.isPresent() && owner.get().rollbackUpdate(resource)) {
+            return true;
+        }
         String rawSnapshot = resource.getAttributes().get(SFN_UPDATE_SNAPSHOT_ATTR);
         if (rawSnapshot == null) {
             return false;
@@ -4729,14 +4775,6 @@ public class CloudFormationResourceProvisioner {
                     "Could not roll back Step Functions state machine "
                             + resource.getLogicalId(), e);
         }
-    }
-
-    record UpdateCleanupResult(
-            boolean applicable,
-            boolean complete,
-            String previousPhysicalId,
-            int attempts,
-            String failureReason) {
     }
 
     private String resolveStateMachineDefinition(JsonNode props, CloudFormationTemplateEngine engine) {
@@ -6039,6 +6077,16 @@ public class CloudFormationResourceProvisioner {
         // On Update, CloudFormation includes the previous ResourceProperties so the handler can diff.
         // The prior values were stashed at the last create/update; read them before we overwrite below.
         ObjectNode oldResourceProperties = isUpdate ? readStashedProperties(r) : null;
+
+        // CloudFormation invokes a custom resource's Update handler only when its resolved
+        // properties changed (UserGuide/template-custom-resources-sns.md: "During a stack update,
+        // if no changes are made to a custom resource, CloudFormation will not send any requests
+        // to it."). Replaying every custom resource during an unrelated stack update can repeat
+        // non-idempotent side effects. The prior resolved properties are already stashed on the
+        // resource, so an exact match is a safe no-op that preserves physical ID and attributes.
+        if (oldResourceProperties != null && oldResourceProperties.equals(resourceProperties)) {
+            return;
+        }
 
         JsonNode response = invokeCustomResourceHandler(serviceToken, requestType, r.getLogicalId(),
                 r.getResourceType(), priorPhysicalId, resourceProperties, oldResourceProperties,

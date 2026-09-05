@@ -866,6 +866,93 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void updateStack_unnamedQueueKeepsItsUrlAndReconcilesAttributes() {
+        // QueueName is createOnly, so an unnamed queue keeps its generated name across updates.
+        // The second UpdateStack then reaches SqsService with a name that exists, which answers
+        // QueueAlreadyExists once an attribute differs: the changed VisibilityTimeout must go
+        // through SetQueueAttributes against the same queue URL instead of a second create.
+        String stackName = "cfn-queue-stable-name-stack";
+        String template = """
+            {
+              "Resources": {
+                "MyQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": { "VisibilityTimeout": %d }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(30))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        String createdResourceXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<LogicalResourceId>MyQueue</LogicalResourceId>"))
+            .extract().asString();
+        String queueUrl = firstPhysicalResourceId(createdResourceXml);
+        assertThat(queueUrl, containsString("/" + stackName + "-MyQueue-"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template.formatted(45))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"));
+
+        String updatedResourceXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+        assertThat(firstPhysicalResourceId(updatedResourceXml), equalTo(queueUrl));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "GetQueueAttributes")
+            .formParam("QueueUrl", queueUrl)
+            .formParam("AttributeName.1", "VisibilityTimeout")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<Name>VisibilityTimeout</Name>"))
+            .body(containsString("<Value>45</Value>"));
+    }
+
+    @Test
     void updateStack_lambdaMutableConfigurationUpdatesInPlace() {
         String stackName = "cfn-lambda-config-update-stack";
         String functionName = "cfn-lambda-config-update-func";
@@ -4185,6 +4272,208 @@ class CloudFormationIntegrationTest {
             .get("/v1/pipes/cfn-test-pipe")
         .then()
             .statusCode(404);
+    }
+
+    @Test
+    void updateStack_reconcilesExistingPipe() {
+        // provision() re-runs on every UpdateStack for every resource regardless of whether its
+        // properties changed, so a fixed-name pipe used to call CreatePipe again and roll back with
+        // "Pipe cfn-update-test-pipe already exists.".
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+            .formParam("TemplateBody", pipeUpdateTemplate("FirstTargetQueue"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+            .formParam("TemplateBody", pipeUpdateTemplate("SecondTargetQueue"))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", "cfn-pipe-update-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_COMPLETE</StackStatus>"))
+            .body(not(containsString("ROLLBACK")));
+
+        // The target change was reconciled in place under the same pipe name.
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/cfn-update-test-pipe")
+        .then()
+            .statusCode(200)
+            .body("Name", equalTo("cfn-update-test-pipe"))
+            .body("Source", containsString("cfn-pipe-update-source"))
+            .body("Target", containsString("cfn-pipe-update-target-second"));
+
+        // Delete the stack and verify the pipe is gone, so the pipe does not outlive this test in
+        // the shared emulator and skew a sibling test counting pipes globally.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", "cfn-pipe-update-stack")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/cfn-update-test-pipe")
+        .then()
+            .statusCode(404);
+    }
+
+    private static String pipeUpdateTemplate(String targetLogicalId) {
+        return """
+            {
+              "Resources": {
+                "SourceQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-source"}
+                },
+                "FirstTargetQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-target-first"}
+                },
+                "SecondTargetQueue": {
+                  "Type": "AWS::SQS::Queue",
+                  "Properties": {"QueueName": "cfn-pipe-update-target-second"}
+                },
+                "MyPipe": {
+                  "Type": "AWS::Pipes::Pipe",
+                  "Properties": {
+                    "Name": "cfn-update-test-pipe",
+                    "Source": { "Fn::GetAtt": ["SourceQueue", "Arn"] },
+                    "Target": { "Fn::GetAtt": ["%s", "Arn"] },
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe-role",
+                    "DesiredState": "STOPPED"
+                  }
+                }
+              }
+            }
+            """.formatted(targetLogicalId);
+    }
+
+    /**
+     * CloudFormation rolls back every resource an update touched, not only the one that failed. A
+     * pipe reconciled in place before a later resource fails goes back to the target it carried,
+     * and the stack reaches UPDATE_ROLLBACK_COMPLETE instead of reporting the pipe as UPDATE_FAILED
+     * for want of a rollback.
+     */
+    @Test
+    void updateStack_laterFailureRestoresThePipeTarget() {
+        String suffix = Long.toString(System.nanoTime(), 36);
+        String stackName = "cfn-pipe-rollback-stack-" + suffix;
+        String pipeName = "cfn-pipe-rollback-pipe-" + suffix;
+        String failingSecret = """
+            ,
+                "BadSecret": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "DependsOn": "MyPipe",
+                  "Properties": {
+                    "Name": "cfn-pipe-rollback-secret-%s",
+                    "SecretString": "explicit",
+                    "GenerateSecretString": {"PasswordLength": 32}
+                  }
+                }""".formatted(suffix);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody",
+                    pipeRollbackTemplate(pipeName, "cfn-pipe-rollback-target-first", ""))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody",
+                    pipeRollbackTemplate(pipeName, "cfn-pipe-rollback-target-second", failingSecret))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>UPDATE_ROLLBACK_COMPLETE</StackStatus>"));
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + pipeName)
+        .then()
+            .statusCode(200)
+            .body("Target", equalTo("arn:aws:sqs:us-east-1:000000000000:cfn-pipe-rollback-target-first"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/json")
+        .when()
+            .get("/v1/pipes/" + pipeName)
+        .then()
+            .statusCode(404);
+    }
+
+    /**
+     * The pipe alone, addressing its queues by ARN. An AWS::SQS::Queue in the same stack would
+     * report UPDATE_FAILED for want of its own rollback and hide the pipe's outcome behind
+     * UPDATE_ROLLBACK_FAILED.
+     */
+    private static String pipeRollbackTemplate(String pipeName, String targetQueueName,
+                                               String failingResource) {
+        return """
+            {
+              "Resources": {
+                "MyPipe": {
+                  "Type": "AWS::Pipes::Pipe",
+                  "Properties": {
+                    "Name": "%1$s",
+                    "Source": "arn:aws:sqs:us-east-1:000000000000:cfn-pipe-rollback-source",
+                    "Target": "arn:aws:sqs:us-east-1:000000000000:%2$s",
+                    "RoleArn": "arn:aws:iam::000000000000:role/pipe-role",
+                    "DesiredState": "STOPPED"
+                  }
+                }%3$s
+              }
+            }
+            """.formatted(pipeName, targetQueueName, failingResource);
     }
 
     // ── TemplateURL (path-style AWS S3) ──────────────────────────────────────

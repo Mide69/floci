@@ -21,7 +21,7 @@ Current MVP 1 limitations:
 
 - Certificate CSR handling creates emulator-local certificates; it does not perform real CA signing.
 - MQTT auth remains permissive; certificate and policy resources are modeled for provisioning compatibility, not enforced as broker authorization yet.
-- Rules support basic topic filter extraction and action dispatch only; SQL projection, WHERE evaluation, substitutions, and error actions remain follow-up scope.
+- Rules support basic topic filter extraction and action dispatch only; SQL projection, WHERE evaluation, and substitutions remain follow-up scope.
 
 ## MVP 2 Coverage
 
@@ -33,7 +33,7 @@ Supported MVP 2 behavior:
 - Static thing groups: `CreateThingGroup`, `DescribeThingGroup`, `ListThingGroups`, `UpdateThingGroup`, `DeleteThingGroup`, `AddThingToThingGroup`, `RemoveThingFromThingGroup`, `ListThingsInThingGroup`, and `ListThingGroupsForThing`.
 - Jobs control plane: `CreateJob`, `DescribeJob`, and `ListJobs`, including thing ARN targets and static thing group targets.
 - Jobs data plane: pending-job listing, `StartNextPendingJobExecution`, `DescribeJobExecution`, and `UpdateJobExecution` with version conflicts and terminal-state checks.
-- Endpoint discovery accepts `iot:Jobs` in addition to IoT Data endpoint types.
+- Endpoint discovery accepts `iot:Jobs` and `iot:CredentialProvider` in addition to IoT Data endpoint types.
 - MQTT clients can use QoS 1 subscribe/publish paths with broker PUBACK and delivery behavior.
 - IoT Data connection APIs for live MQTT sessions: `GetConnection`, `DeleteConnection`, `ListSubscriptions`, and `SendDirectMessage`.
 - `DeleteConnection` closes active MQTT client sessions through the embedded broker and optionally purges broker session state for `cleanSession=true`.
@@ -47,6 +47,25 @@ Current MVP 2 limitations:
 - `GetConnection` and `ListSubscriptions` report live in-memory broker state only; offline persistent session subscription reporting is not modeled yet.
 - Jobs reserved MQTT topics remain follow-up scope; Jobs Data HTTP APIs are implemented first.
 - Dynamic thing groups, fleet indexing, job rollouts, cancellations, documents from S3, and advanced job scheduling are not yet modeled.
+
+## Domain Configurations
+
+Status: control plane only.
+
+`CreateDomainConfiguration`, `DescribeDomainConfiguration`, `UpdateDomainConfiguration`, `DeleteDomainConfiguration` and `ListDomainConfigurations` are served on the REST-JSON paths the AWS SDKs use, with the AWS shapes and error codes:
+
+- A new configuration is `ENABLED` and `CUSTOMER_MANAGED`, its server certificate is reported `VALID`, and its ARN carries the short id AWS appends (`domainconfiguration/<name>/<id>`). A configuration created without a domain name has the `ENDPOINT` domain type.
+- `UpdateDomainConfiguration` changes the status, the authorizer (or removes it with `removeAuthorizerConfig`), the TLS, server certificate and client certificate settings, the authentication type and the application protocol.
+- `DeleteDomainConfiguration` refuses an `ENABLED` configuration with `InvalidRequestException`; disable it first, as on AWS.
+- `ListDomainConfigurations` filters by `serviceType` and pages with `marker` and `pageSize`.
+- Tags work through `TagResource`, `UntagResource` and `ListTagsForResource` on the configuration ARN.
+- CloudFormation provisions `AWS::IoT::DomainConfiguration` through the same operations; see the CloudFormation service page for the attribute list.
+- The four AWS-managed configurations every account has (`iot:Data-ATS`, `iot:Data`, `iot:CredentialProvider`, `iot:Jobs`) exist in every region without being created: `AWS_MANAGED`, `ENABLED`, no server certificate, and the address `DescribeEndpoint` returns as their domain name. They can be updated and tagged but not deleted, as on AWS.
+
+Current limitations:
+
+- A custom domain does not change where the broker listens. `DescribeEndpoint` keeps returning Floci's own address, and pointing DNS at the emulator is outside its scope.
+- Server certificate ARNs are stored as given and reported `VALID`; they are not checked against ACM.
 
 ## MQTT Broker
 
@@ -129,13 +148,15 @@ Supported rule behavior:
 - `sqs` action sends the original payload to an SQS queue through Floci's SQS service boundary.
 - `sns` action publishes the original payload to an SNS topic through Floci's SNS service boundary.
 - `s3` action writes the original payload to the configured bucket/key through Floci's S3 service boundary.
-- `dynamoDBv2` action writes JSON object payload fields as DynamoDB attribute values through Floci's DynamoDB service boundary.
+- `dynamoDBv2` action writes JSON object payload fields as DynamoDB attribute values through Floci's DynamoDB service boundary; nested objects and arrays become maps and lists.
 - `kinesis` action puts the original payload into a Kinesis stream through Floci's Kinesis service boundary.
 - `lambda` action invokes the configured function ARN through Floci's Lambda service boundary.
+- One failing action never fails the publish or the other actions of the rule. The failure is logged, and once every action ran the rule's `errorAction` receives the AWS failure document: `ruleName`, `topic`, `base64OriginalPayload` and `failures` with `failedAction`, `failedResource` and `errorMessage` per failed action.
+- `GetTopicRule` returns `awsIotSqlVersion` and `errorAction` as they were given to `CreateTopicRule` or `ReplaceTopicRule`.
 
 Current limitations:
 
-- SQL projection, WHERE clauses, functions, substitutions, error actions, and less common AWS IoT rule action types are follow-up scope.
+- SQL projection, WHERE clauses, functions, substitutions, and less common AWS IoT rule action types are follow-up scope.
 
 Open follow-up scope for phase 7 unless explicitly deferred:
 
