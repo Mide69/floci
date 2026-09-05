@@ -519,11 +519,12 @@ public class DynamoDbService implements ResourceProvider {
         putItem(tableName, item, null, null, null, region, "NONE");
     }
 
-    public void putItem(String tableName, JsonNode item,
+    /** Returns the previous item stored under the same key, or null when the put inserted. */
+    public JsonNode putItem(String tableName, JsonNode item,
                          String conditionExpression,
                          JsonNode exprAttrNames, JsonNode exprAttrValues,
                          String region, String returnValuesOnConditionCheckFailure) {
-        putItemInternal(tableName, item, conditionExpression, exprAttrNames, exprAttrValues,
+        return putItemInternal(tableName, item, conditionExpression, exprAttrNames, exprAttrValues,
                         region, returnValuesOnConditionCheckFailure, true);
     }
 
@@ -871,7 +872,7 @@ public class DynamoDbService implements ResourceProvider {
         List<String> sortKeyNames = accessPath.sortKeyNames();
 
         var items = itemsByTable.get(scopedItemsKey(storageKey));
-        if (items == null) return new QueryResult(List.of(), 0, null);
+        if (items == null) return new QueryResult(List.of(), 0, 0, null);
 
         List<JsonNode> results = new ArrayList<>();
 
@@ -973,7 +974,7 @@ public class DynamoDbService implements ResourceProvider {
         int accSize = 0;
         int included = -1; // index one past the last included item; -1 = no boundary hit
         for (int i = 0; i < evaluatedItems.size(); i++) {
-            int sz = DynamoDbItemSize.calculateItemSize(evaluatedItems.get(i));
+            int sz = readItemSize(evaluatedItems.get(i), accessPath, table);
             if (accSize > 0 && accSize + sz > MAX_RESPONSE_BYTES) {
                 included = i; // the 1 MB cap stops the read BEFORE this item
                 break;
@@ -1000,7 +1001,7 @@ public class DynamoDbService implements ResourceProvider {
 
         LOG.tracev("Query on {0}: returned={1} scanned={2}",
                 canonicalTableName, evaluatedItems.size(), scannedCount);
-        return new QueryResult(evaluatedItems, scannedCount, lastEvaluatedKey);
+        return new QueryResult(evaluatedItems, scannedCount, accSize, lastEvaluatedKey);
     }
 
     public ScanResult scan(String tableName, String filterExpression,
@@ -1023,7 +1024,7 @@ public class DynamoDbService implements ResourceProvider {
         DynamoDbAccessPath accessPath = DynamoDbAccessPath.resolve(table, indexName);
 
         var items = itemsByTable.get(scopedItemsKey(storageKey));
-        if (items == null) return new ScanResult(List.of(), 0, null);
+        if (items == null) return new ScanResult(List.of(), 0, 0, null);
 
         // ConcurrentSkipListMap keeps items sorted by base item key — no sort needed.
         // Use tailMap for O(log n) pagination instead of O(n) linear search.
@@ -1067,7 +1068,7 @@ public class DynamoDbService implements ResourceProvider {
             // is not read, does not count toward ScannedCount, and the cursor
             // anchors to the previous scanned item (which, with a filter, may well
             // be an item that was not returned).
-            int sz = DynamoDbItemSize.calculateItemSize(item);
+            int sz = readItemSize(item, accessPath, table);
             if (accSize > 0 && accSize + sz > MAX_RESPONSE_BYTES) {
                 lastEvaluatedKey = buildKeyNode(table, lastScanned, lekPkName, lekSkName, indexScan);
                 break;
@@ -1094,7 +1095,18 @@ public class DynamoDbService implements ResourceProvider {
 
         LOG.tracev("Scan on {0}: returned={1} scanned={2}",
                 canonicalTableName, results.size(), totalScanned);
-        return new ScanResult(results, totalScanned, lastEvaluatedKey);
+        return new ScanResult(results, totalScanned, accSize, lastEvaluatedKey);
+    }
+
+    // A read served by a KEYS_ONLY or INCLUDE index is sized on the projection the
+    // index stores, not on the full base item. Characterised on real AWS (us-east-1,
+    // 2026-09-05): querying a 20KB item through a KEYS_ONLY GSI costs 0.5 units.
+    private int readItemSize(JsonNode item, DynamoDbAccessPath accessPath, TableDefinition table) {
+        if (!accessPath.isIndex() || "ALL".equals(accessPath.projectionType())) {
+            return DynamoDbItemSize.calculateItemSize(item);
+        }
+        return DynamoDbItemSize.calculateItemSize(ProjectionEvaluator.trimToAttributes(
+                (ObjectNode) item, accessPath.projectedAttributeNames(table)));
     }
 
     public boolean matchesScanFilterPublic(JsonNode item, JsonNode scanFilter) {
@@ -3186,8 +3198,11 @@ public class DynamoDbService implements ResourceProvider {
     }
 
     public record UpdateResult(JsonNode newItem, JsonNode oldItem) {}
-    public record ScanResult(List<JsonNode> items, int scannedCount, JsonNode lastEvaluatedKey) {}
-    public record QueryResult(List<JsonNode> items, int scannedCount, JsonNode lastEvaluatedKey) {}
+
+    // scannedBytes carries the pre-filter size of the read items: DynamoDB bills a
+    // Query or Scan on what it read, not on what survived the filter or projection.
+    public record ScanResult(List<JsonNode> items, int scannedCount, long scannedBytes, JsonNode lastEvaluatedKey) {}
+    public record QueryResult(List<JsonNode> items, int scannedCount, long scannedBytes, JsonNode lastEvaluatedKey) {}
 
     // --- Export Operations ---
 
