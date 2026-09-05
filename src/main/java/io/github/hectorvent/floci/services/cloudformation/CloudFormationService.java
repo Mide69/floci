@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.ssm.SsmService;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -291,6 +292,21 @@ public class CloudFormationService implements ResourceProvider {
                 if (isCreateType && !reusableReviewPlaceholder) {
                     throw new AwsException("AlreadyExistsException",
                             "Stack [" + stackName + "] already exists", 400);
+                }
+                // A status ending in _IN_PROGRESS says an operation owns the stack: a create, an
+                // update, a rollback or the cleanup phase of a committed update. AWS refuses to
+                // start a second one over it, and offers nothing that finishes a phase whose
+                // process is gone - DeleteStack is the only way out of one. Refusing here keeps
+                // every abandoned phase out of the next update's transaction.
+                //
+                // The message is the one real CloudFormation emits, down to its own "can not"
+                // spelling and the stack id carried as "Stack:<arn>" with no space: clients match
+                // on this string.
+                if (!isCreateType && existing.getStatus() != null
+                        && existing.getStatus().endsWith("_IN_PROGRESS")) {
+                    throw new AwsException("ValidationError",
+                            "Stack:" + existing.getStackId() + " is in " + existing.getStatus()
+                                    + " state and can not be updated.", 400);
                 }
                 target = existing;
             }
@@ -1307,8 +1323,7 @@ public class CloudFormationService implements ResourceProvider {
                         null);
             }
             while (true) {
-                CloudFormationResourceProvisioner.UpdateCleanupResult result =
-                        provisioner.completeUpdate(resource);
+                UpdateCleanupResult result = provisioner.completeUpdate(resource);
                 if (!result.applicable()) {
                     break;
                 }
@@ -1778,6 +1793,13 @@ public class CloudFormationService implements ResourceProvider {
             Collections.reverse(resources); // Dependents go before what they depend on
 
             List<String> failedResources = new ArrayList<>();
+            // The walk below addresses each resource by its physical id, which names the entity the
+            // last update left in place. An entity displaced by a replacement whose cleanup phase
+            // never ended is named only by the cleanup the resource still carries, so the stack
+            // deletes that one too: nothing else ever will.
+            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack)) {
+                failedResources.add(displacedFailure.logicalId());
+            }
             for (StackResource resource : resources) {
                 // CREATE_COMPLETE/UPDATE_COMPLETE: first delete attempt. DELETE_FAILED: a previous
                 // delete left the resource behind (e.g. the bucket was non-empty); AWS re-attempts

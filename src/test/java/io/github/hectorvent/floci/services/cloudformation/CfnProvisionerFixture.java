@@ -209,7 +209,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new EcrCfnProvisioner(ecrService));
             }
             if (pipesService != null) {
-                discovered.add(new PipesCfnProvisioner(pipesService));
+                discovered.add(new PipesCfnProvisioner(pipesService, objectMapper));
             }
             if (cognitoService != null) {
                 discovered.add(new CognitoCfnProvisioner(cognitoService));
