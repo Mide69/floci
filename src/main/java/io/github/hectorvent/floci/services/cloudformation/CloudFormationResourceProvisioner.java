@@ -1175,16 +1175,12 @@ public class CloudFormationResourceProvisioner {
     }
 
     private List<String> resolveStringList(JsonNode props, String field, CloudFormationTemplateEngine engine) {
-        List<String> values = new ArrayList<>();
-        if (props != null && props.has(field) && props.get(field).isArray()) {
-            for (JsonNode element : props.get(field)) {
-                String resolved = engine.resolve(element);
-                if (resolved != null && !resolved.isBlank()) {
-                    values.add(resolved);
-                }
-            }
+        if (props == null || !props.has(field)) {
+            return new ArrayList<>();
         }
-        return values;
+        // engine.resolveStringList accepts both a literal array and a list-valued intrinsic
+        // (Fn::Split / Fn::GetAZs / Fn::Cidr) and drops blank entries (issue #2937).
+        return new ArrayList<>(engine.resolveStringList(props.get(field)));
     }
 
     private String blankToNull(String value) {
@@ -1299,12 +1295,12 @@ public class CloudFormationResourceProvisioner {
         }
         String description = firstNonBlank(resolveOptional(props, "DBSubnetGroupDescription", engine),
                 "Managed by CloudFormation");
-        List<String> subnetIds = new ArrayList<>();
-        if (props != null && props.has("SubnetIds") && props.get("SubnetIds").isArray()) {
-            for (JsonNode subnet : props.get("SubnetIds")) {
-                subnetIds.add(engine.resolve(subnet));
-            }
-        }
+        // SubnetIds may be a literal array, or a list-valued intrinsic — e.g. CDK's
+        // Fn::Split over a cross-stack Fn::ImportValue when the source VPC exports its
+        // subnet ids as one comma-joined value (issue #2937).
+        List<String> subnetIds = props != null && props.has("SubnetIds")
+                ? engine.resolveStringList(props.get("SubnetIds"))
+                : new ArrayList<>();
 
         // On UpdateStack, provision() is re-invoked for every resource regardless of whether its
         // properties actually changed, so a same-named group already on file must be reconciled in
