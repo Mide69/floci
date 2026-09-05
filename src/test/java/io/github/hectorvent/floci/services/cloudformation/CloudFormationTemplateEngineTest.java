@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -141,5 +142,59 @@ class CloudFormationTemplateEngineTest {
         JsonNode resolved = engineWithCondition("UseProdTags", true).resolveNode(ifNode);
 
         assertEquals("us-east-1", resolved.get(0).get("Value").asText());
+    }
+
+    private CloudFormationTemplateEngine engineWithParameter(String name, String value) {
+        return new CloudFormationTemplateEngine("000000000000", "us-east-1", "my-stack",
+                "stack/id", Map.of(name, value), Map.of(), Map.of(), Map.of(), Map.of(), mapper,
+                (Function<String, String>) n -> null);
+    }
+
+    // github.com/floci-io/floci/issues/2848 (Greptile review on the follow-up fix): "List
+    // intrinsics remain scalar" - resolveNode's Fn::If fix alone does not make Fn::Split or a Ref
+    // to a CommaDelimitedList parameter list-shaped, since resolveNode never split anything to
+    // begin with. resolveList is the engine's dedicated list resolver and already handled
+    // Fn::Split and comma-delimited scalars correctly; it only needed Fn::If added.
+
+    @Test
+    void resolveListSplitsFnSplitWithItsActualDelimiter() {
+        assertEquals(List.of("a", "b", "c"),
+                engine().resolveList(json("{\"Fn::Split\": [\"|\", \"a|b|c\"]}")));
+    }
+
+    @Test
+    void resolveListSplitsACommaDelimitedListParameterRef() {
+        assertEquals(List.of("a", "b", "c"),
+                engineWithParameter("Csv", "a,b,c").resolveList(json("{\"Ref\": \"Csv\"}")));
+    }
+
+    @Test
+    void resolveListResolvesFnIfChoosingBetweenTwoFnSplitLists() {
+        // The delimiter is deliberately not a comma: falling through to the pre-existing
+        // scalar-then-comma-split fallback (rather than actually recursing into the Fn::Split
+        // branch) would return the whole unsplit "a|b|c" source as a single element instead of
+        // the three pipe-split ones, so this only passes if resolveList's own Fn::If handling
+        // is what runs.
+        JsonNode node = json("""
+                {"Fn::If": ["UseReportBatch",
+                    {"Fn::Split": ["|", "a|b|c"]},
+                    {"Fn::Split": ["|", "x|y"]}]}
+                """);
+
+        assertEquals(List.of("a", "b", "c"),
+                engineWithCondition("UseReportBatch", true).resolveList(node));
+        assertEquals(List.of("x", "y"),
+                engineWithCondition("UseReportBatch", false).resolveList(node));
+    }
+
+    @Test
+    void resolveListResolvesFnIfChoosingBetweenACommaDelimitedRefAndALiteralArray() {
+        JsonNode node = json("{\"Fn::If\": [\"UseParam\", {\"Ref\": \"Csv\"}, [\"fallback\"]]}");
+
+        CloudFormationTemplateEngine trueEngine = new CloudFormationTemplateEngine(
+                "000000000000", "us-east-1", "my-stack", "stack/id",
+                Map.of("Csv", "x,y"), Map.of(), Map.of(), Map.of("UseParam", true), Map.of(), mapper,
+                (Function<String, String>) n -> null);
+        assertEquals(List.of("x", "y"), trueEngine.resolveList(node));
     }
 }

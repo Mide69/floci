@@ -270,10 +270,10 @@ public class CloudFormationTemplateEngine {
 
     /**
      * Resolves a node that represents a list — a literal array, a list-producing intrinsic
-     * ({@code Fn::GetAZs}, {@code Fn::Cidr}, {@code Fn::Split}), or a comma-delimited scalar
-     * (e.g. a {@code Ref} to a {@code List<>} parameter).
+     * ({@code Fn::GetAZs}, {@code Fn::Cidr}, {@code Fn::Split}), an {@code Fn::If} choosing between
+     * two such lists, or a comma-delimited scalar (e.g. a {@code Ref} to a {@code List<>} parameter).
      */
-    private List<String> resolveList(JsonNode node) {
+    public List<String> resolveList(JsonNode node) {
         List<String> out = new ArrayList<>();
         if (node == null || node.isNull() || node.isMissingNode()) {
             return out;
@@ -285,6 +285,14 @@ public class CloudFormationTemplateEngine {
             return out;
         }
         if (node.isObject()) {
+            if (node.has("Fn::If")) {
+                // Fn::If's branch can itself be any of the shapes this method already handles
+                // (literal array, Fn::Split, ...), so recurse into it rather than falling through
+                // to the scalar branch below, which would stringify a list-shaped branch instead
+                // of splitting it.
+                JsonNode branch = selectIfBranch(node.get("Fn::If"));
+                return branch == null ? out : resolveList(branch);
+            }
             if (node.has("Fn::GetAZs")) {
                 return resolveAvailabilityZones(node.get("Fn::GetAZs"));
             }

@@ -4160,11 +4160,14 @@ public class CloudFormationResourceProvisioner {
             }
         }
 
-        // resolveStringListOrEmpty (not resolveStringList) because it resolves the whole property
-        // through resolveNode first, so a whole-property intrinsic like Fn::If or Fn::Split - or a
-        // Ref to a CommaDelimitedList parameter - is evaluated instead of silently rejected by a
-        // raw isArray() check on the unresolved node.
-        List<String> functionResponseTypes = resolveStringListOrEmpty(props, "FunctionResponseTypes", engine);
+        // resolveList (not resolveStringList/resolveStringListOrEmpty) because it is the engine's
+        // purpose-built list resolver: besides a literal array it also evaluates Fn::Split with its
+        // actual delimiter, an Fn::If choosing between two such lists, and a Ref to a
+        // CommaDelimitedList parameter (comma-split as a fallback), none of which the raw
+        // isArray()-on-the-unresolved-node check in the other two helpers can see.
+        List<String> functionResponseTypes = props != null
+                ? engine.resolveList(props.get("FunctionResponseTypes"))
+                : List.of();
         if (!functionResponseTypes.isEmpty()) {
             req.put("FunctionResponseTypes", functionResponseTypes);
         }
